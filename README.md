@@ -6,12 +6,11 @@ Sagasu gives headless agents a way to hand a live browser session to a human —
 
 ## The problem
 
-Agents doing real work on the web constantly hit walls that require a human: CAPTCHA challenges, SSO logins, 2FA prompts, consent screens. The ad-hoc answer is to hand-assemble Xvfb + a browser + x11vnc + noVNC on the host and send the user a URL to that one session. It works once, but it has clear limits:
+Agents doing real work on the web constantly hit walls that require a human: CAPTCHA challenges, SSO logins, 2FA prompts, consent screens. And the ways agents browse the web today have structural problems:
 
-- **Not reproducible.** Every setup is an ad-hoc sequence of `apt-get` installs, host-level scripts, and pkill incantations that pollute the machine and drift between hosts.
-- **One session at a time.** Ports, display numbers, and profile paths are hardcoded; concurrent agents collide.
-- **No coordination.** Each handoff produces its own URL and password that must be manually relayed to the human. Three agents blocked on three CAPTCHAs means three URLs pasted into three chats, in no particular order.
-- **Ephemeral state.** Logged-in sessions live in throwaway profile dirs; the human re-authenticates for every new task.
+- **Computer use takes over your device.** Computer-use and active browser-use agents drive *your* screen, keyboard, and browser. While the agent works, the machine is effectively unusable — and since there is one desktop and one cursor, parallelism and multi-agent sessions are a non-starter.
+- **No coordination when a human is needed.** Each blocked agent surfaces its own ask through its own channel. Three agents blocked on three CAPTCHAs means three URLs pasted into three chats, in no particular order, with nothing tracking what's pending or resolved.
+- **Ephemeral state.** Browser sessions live in throwaway profiles; every new task starts logged out, and the human re-authenticates to the same sites over and over.
 
 ## The idea
 
@@ -31,7 +30,7 @@ flowchart TB
     H[Human] --> P
 ```
 
-Four layers, each replacing a piece of the ad-hoc approach:
+Four layers, together answering those problems: browsers run in containers off to the side (your device stays yours, sessions scale horizontally), state persists in named profiles, and every human ask lands in one queue.
 
 ### 1. Docker runtime — reproducibility
 
