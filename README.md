@@ -6,11 +6,17 @@ Sagasu gives headless agents a way to hand a live browser session to a human —
 
 ## The problem
 
-Agents doing real work on the web constantly hit walls that require a human: CAPTCHA challenges, SSO logins, 2FA prompts, consent screens. And the ways agents browse the web today have structural problems:
+Agents doing real work on the web constantly hit walls that require a human: CAPTCHA challenges, SSO logins, 2FA prompts, consent screens. And the ways agents browse the web today — including the existing human-handoff tools — have structural problems:
 
 - **Computer use takes over your device.** Computer-use and active browser-use agents drive *your* screen, keyboard, and browser. While the agent works, the machine is effectively unusable — and since there is one desktop and one cursor, parallelism and multi-agent sessions are a non-starter.
-- **No coordination when a human is needed.** Each blocked agent surfaces its own ask through its own channel. Three agents blocked on three CAPTCHAs means three URLs pasted into three chats, in no particular order, with nothing tracking what's pending or resolved.
+- **The agent can't raise its hand.** Existing handoff tools are watch-and-intervene: a human must already be looking at the screen to notice the agent is stuck. There is no primitive for the agent to signal "I'm blocked on a CAPTCHA at session X — come help."
+- **There's no resume signal either.** The mirror problem: after the human solves the challenge, nothing tells the agent it's done. Agents poll the DOM hoping the challenge iframe disappeared, or the human types "done" into a chat.
+- **Session sprawl instead of a fleet.** Every blocked session surfaces its own URL and password through its own channel. Three agents blocked on three CAPTCHAs means three links pasted into three chats, in no particular order, with nothing tracking what's pending or resolved.
 - **Ephemeral state.** Browser sessions live in throwaway profiles; every new task starts logged out, and the human re-authenticates to the same sites over and over.
+- **The CAPTCHA comes back.** Anti-bot systems challenge fresh, anonymous-looking sessions far more aggressively than established ones. A throwaway browser that gets a human solve and is then discarded re-triggers the same challenge on the next task — handoff degenerates into a CAPTCHA treadmill for the human. (When and why this happens: [Problems.md](./Problems.md).)
+- **Solvers hit a coverage ceiling.** Automated captcha-solving integrations work per-type: every supported family (reCAPTCHA, hCaptcha, GeeTest, …) is a dedicated integration that must be built and maintained, and everything outside the list is a dead end — custom in-house widgets, new captcha versions during the catch-up lag, regional systems beyond the big names (common on the Chinese web), and verification that isn't a captcha at all (SMS codes, WeChat/Alipay QR-code logins, confirm-on-your-phone). Some challenges also score *how* the answer is produced — GeeTest checks the mouse trajectory of the slider drag, so computing the right answer still fails the biometric. A human working inside the agent's own session covers all of it: anything a human can do in a browser, including scanning an on-screen QR code with their phone. Coverage is categorical, not a per-type list.
+
+Implementation challenges encountered while building this are tracked separately in [Problems.md](./Problems.md).
 
 ## The idea
 
