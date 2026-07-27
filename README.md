@@ -2,11 +2,11 @@
 
 **Human-in-the-loop browser infrastructure for autonomous agents.**
 
-Sagasu gives headless agents a way to hand a live browser session to a human — for CAPTCHAs, logins, 2FA, or anything else an agent shouldn't (or can't) do itself — and then take the session back and keep working. It is the productized evolution of the [`tailnet-novnc-browser-handoff`](./tailnet-novnc-browser-handoff.md) skill: what started as a step-by-step recipe one agent walks through on one host becomes a reproducible, multi-agent, multi-session system with a single place for humans to service requests.
+Sagasu gives headless agents a way to hand a live browser session to a human — for CAPTCHAs, logins, 2FA, or anything else an agent shouldn't (or can't) do itself — and then take the session back and keep working: a reproducible, multi-agent, multi-session system with a single place for humans to service requests.
 
 ## The problem
 
-Agents doing real work on the web constantly hit walls that require a human: CAPTCHA challenges, SSO logins, 2FA prompts, consent screens. The v1 skill solved this for a single session by hand-assembling Xvfb + Chromium + x11vnc + noVNC on the host and sending the user a tailnet-only URL. It works, but it has clear limits:
+Agents doing real work on the web constantly hit walls that require a human: CAPTCHA challenges, SSO logins, 2FA prompts, consent screens. The ad-hoc answer is to hand-assemble Xvfb + a browser + x11vnc + noVNC on the host and send the user a URL to that one session. It works once, but it has clear limits:
 
 - **Not reproducible.** Every setup is an ad-hoc sequence of `apt-get` installs, host-level scripts, and pkill incantations that pollute the machine and drift between hosts.
 - **One session at a time.** Ports, display numbers, and profile paths are hardcoded; concurrent agents collide.
@@ -31,7 +31,7 @@ flowchart TB
     H[Human] --> P
 ```
 
-Four layers, each replacing an ad-hoc piece of the original skill:
+Four layers, each replacing a piece of the ad-hoc approach:
 
 ### 1. Docker runtime — reproducibility
 
@@ -41,7 +41,7 @@ The browser itself is a configuration choice, not a hardcoded dependency. The de
 
 ### 2. noVNC layer — persistent browser profiles
 
-Browser sessions are launched against **named, persistent profiles** stored on volumes. When a human logs into a site once, that authenticated state (cookies, sessions) survives the container and is reusable by any agent on subsequent tasks. Log in to a service on Monday; agents keep working inside that session all week. Profiles are treated as sensitive material: they stay on the tailnet-side of the boundary and are never baked into images.
+Browser sessions are launched against **named, persistent profiles** stored on volumes. When a human logs into a site once, that authenticated state (cookies, sessions) survives the container and is reusable by any agent on subsequent tasks. Log in to a service on Monday; agents keep working inside that session all week. Profiles are treated as sensitive material: they never leave the host's network boundary and are never baked into images.
 
 ### 3. Browser sessions — one per agent task
 
@@ -50,7 +50,7 @@ Each agent request gets its own browser with two faces:
 - **CDP endpoint** (agent-facing): the agent drives the browser programmatically before and after the human steps in.
 - **noVNC view** (human-facing): the same live session, viewable and controllable from a web page when handoff is needed.
 
-The agent and the human are looking at — and taking turns driving — the *same* browser. That is the core trick inherited from v1, and it's what makes "human solves the CAPTCHA, agent continues the job" seamless.
+The agent and the human are looking at — and taking turns driving — the *same* browser. That is the core trick, and it's what makes "human solves the CAPTCHA, agent continues the job" seamless.
 
 **Screenshots are a first-class agent capability — and the expected first move.** Since every session already has a rendered display, the agent can capture the browser window at any time and *see* the page the way the human would. The intended workflow is look-first: screenshot to understand what's actually on screen (layout, modals, error banners, a CAPTCHA that just appeared), then act programmatically via CDP — rather than diving DOM-first into a page it has never seen. This also makes handoffs smarter: an agent that can see a challenge widget knows to enqueue a `captcha` request instead of fumbling selectors against it.
 
@@ -69,7 +69,7 @@ One URL, one credential, every blocked agent visible at a glance.
 Installing the skill is not enough on its own — Sagasu requires an explicit setup pass before the first session, in the style of skills that ship `/setup` and `/config` commands. Setup is where the deployment-shaping choices get made once, recorded in a config file, and inherited by every session afterward:
 
 - **Browser** — which browser runs inside noVNC. Default: **Helium** (lightweight Chromium fork); alternatives selectable at setup.
-- **Network boundary** — tailnet (default), localhost-only, or bring-your-own proxy/VPN.
+- **Network boundary** — LAN (default), localhost-only, or bring-your-own proxy/VPN.
 - **Profile storage** — where persistent browser profiles live on disk.
 - **Panel** — port/address and access credential for the dashboard.
 
@@ -89,7 +89,7 @@ sagasu handoff status <session-id>                             # has the human r
 sagasu session stop <session-id>                               # tear down (profile persists)
 ```
 
-The skill md teaches an agent *when* to reach for these commands and the safety rules around them, exactly as the v1 skill did for the manual procedure. The skill's install flow points at `sagasu setup` as the mandatory first step, and its workflow guidance tells agents to screenshot before scripting — visual understanding first, CDP second.
+The skill md teaches an agent *when* to reach for these commands and the safety rules around them. Its install flow points at `sagasu setup` as the mandatory first step, and its workflow guidance tells agents to screenshot before scripting — visual understanding first, CDP second.
 
 The design rule that keeps the CLI honest: **it only automates what has exactly one correct way to be done** — container lifecycle, port/volume wiring, screenshots, queue registration. It is an on-ramp, not a gatekeeper: `session start` prints the CDP endpoint and gets out of the way, and everything requiring judgment (what to click, when to hand off, which URL to open) stays with the agent talking CDP directly to the browser.
 
@@ -115,11 +115,13 @@ sagasu/
 
 Three of these are the load-bearing pieces: the **Dockerfile** defines the reproducible environment, the **panel** is the human's side of the system, and **skill.md** is the agent's side. The compose file, CLI, and docs exist to make those three usable without ceremony.
 
-## Network model: tailnet by default, pluggable by design
+## Network model: LAN by default, pluggable by design
 
-The default trust boundary is unchanged from v1: the panel and noVNC endpoints bind to a Tailscale address only, and internals (VNC, CDP) stay on localhost/container networks. But the boundary is a deployment choice, not an assumption baked into the code — swapping in localhost-only, a reverse proxy with its own auth, or another VPN should be configuration, not surgery.
+The human-facing surfaces (panel, noVNC) bind to the host's LAN address; internals (VNC, CDP) stay on localhost/container networks. LAN is the default because it assumes nothing: not everyone runs Tailscale, and anyone who does can already reach the LAN address through their tailnet — so VPN access comes for free without being a dependency. Because a LAN is broader than a VPN-only binding, the panel carries its own access credential: the local network is reachable, not trusted.
 
-## Principles (carried over from v1)
+The boundary remains a deployment choice, not an assumption baked into the code — tightening to localhost-only, or fronting with a reverse proxy or VPN of your choice, should be configuration, not surgery.
+
+## Principles
 
 - **Handoff, not bypass.** Sagasu lets a human complete challenges in an agent-controlled browser. It does not and will not automate CAPTCHA solving or circumvent site protections.
 - **Humans own their secrets.** Agents never ask for, read, or handle passwords and 2FA codes — they open the page and step aside.
@@ -128,9 +130,6 @@ The default trust boundary is unchanged from v1: the panel and noVNC endpoints b
 
 ## Status
 
-Early design. This repo currently contains:
+Early design — this README is the direction; the components are not built yet.
 
-- [`tailnet-novnc-browser-handoff.md`](./tailnet-novnc-browser-handoff.md) — the v1 skill this project generalizes.
-- This README — the direction.
-
-Rough build order: containerize the v1 stack (Helium default) with the Dockerfile + compose file → `setup`/`config` flow → session lifecycle CLI with named profiles → intervention queue + panel → embedded noVNC and agent-resume signaling → skill.md + docs written against the working system.
+Rough build order: containerize the browser stack (Helium default) with the Dockerfile + compose file → `setup`/`config` flow → session lifecycle CLI with named profiles → intervention queue + panel → embedded noVNC and agent-resume signaling → skill.md + docs written against the working system.
