@@ -105,6 +105,7 @@ FROM ${BASE_IMAGE} AS runtime
 
 ARG BROWSER=helium
 ARG HELIUM_VERSION=0.14.9.1
+ARG HUMANCURSOR_VERSION=1.1.5
 ARG NOVNC_VERSION=1.6.0
 ARG SAGASU_UID=1000
 ARG SAGASU_GID=1000
@@ -121,6 +122,11 @@ SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 #   novnc            drags in nodejs; vendored statically instead
 #   locales          C.UTF-8 is built into glibc
 #   pulseaudio/pipewire, xfonts-base, tigervnc-tools, any DE, xterm, curl, gnupg
+#
+# HumanCursor/PyAutoGUI is the primary X cursor backend. xdotool remains the
+# low-level X cursor/keyboard fallback, and scrot captures the matching full
+# display (browser chrome included). Python dependencies live in an isolated
+# venv below rather than modifying Debian's externally-managed system Python.
 #
 # The Mesa software-rasteriser stack cannot be excluded by dependency choice:
 # tigervnc-standalone-server hard-Depends on libgl1 -> libglx0 -> libglx-mesa0
@@ -145,6 +151,13 @@ RUN printf '%s\n' \
       openbox \
       websockify \
       socat \
+      xdotool \
+      scrot \
+      python3-venv \
+      python3-numpy \
+      python3-pil \
+      python3-tk \
+      python3-xlib \
       tini \
       ca-certificates \
       fontconfig \
@@ -183,6 +196,21 @@ RUN printf '%s\n' \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*; \
     fc-cache -f
+
+# --- human cursor ----------------------------------------------------------
+# HumanCursor's SystemCursor uses PyAutoGUI to inject mouse events into the
+# session's real Xvnc display. --system-site-packages reuses Debian's
+# architecture-matched NumPy and Pillow. HumanCursor currently imports its
+# Selenium-backed WebCursor at package import time, so installing the complete
+# pinned distribution is intentional even though Sagasu's default interaction
+# path only uses SystemCursor.
+RUN python3 -m venv --system-site-packages /opt/sagasu-humancursor \
+ && /opt/sagasu-humancursor/bin/python -m pip install \
+      --disable-pip-version-check \
+      --no-cache-dir \
+      "HumanCursor==${HUMANCURSOR_VERSION}" \
+ && test "$(/opt/sagasu-humancursor/bin/python -c \
+      'from importlib.metadata import version; print(version("HumanCursor"))')" = "${HUMANCURSOR_VERSION}"
 
 # --- noVNC static files ----------------------------------------------------
 COPY --from=fetcher /opt/novnc /usr/share/novnc
@@ -236,7 +264,11 @@ RUN chmod 0755 \
 # --- runtime configuration -------------------------------------------------
 # BROWSER_BIN resolves to /usr/bin/helium (symlink -> helium-wrapper) or
 # /usr/bin/chromium depending on the variant.
+# Xvnc is reachable only through its in-container Unix socket and does not use
+# an Xauthority database. Python Xlib nevertheless insists on opening one, so
+# /dev/null explicitly represents the empty database SystemCursor should use.
 ENV DISPLAY=:1 \
+    XAUTHORITY=/dev/null \
     SCREEN_GEOMETRY=1366x768 \
     SCREEN_DEPTH=24 \
     START_URL=about:blank \
@@ -248,6 +280,7 @@ ENV DISPLAY=:1 \
     CDP_INTERNAL_PORT=9229 \
     BROWSER_BIN=/usr/bin/${BROWSER} \
     BROWSER_EXTRA_ARGS= \
+    HUMANCURSOR_PYTHON=/opt/sagasu-humancursor/bin/python \
     SAGASU_NO_SANDBOX= \
     SAGASU_USER=sagasu \
     HOME=/home/sagasu \
@@ -270,6 +303,7 @@ LABEL org.opencontainers.image.title="sagasu-session" \
       org.opencontainers.image.base.name="debian:trixie-slim" \
       computer.sagasu.browser="${BROWSER}" \
       computer.sagasu.helium.version="${HELIUM_VERSION}" \
+      computer.sagasu.humancursor.version="${HUMANCURSOR_VERSION}" \
       computer.sagasu.novnc.version="${NOVNC_VERSION}"
 
 # tini is baked in rather than left to compose `init:` so PID 1 reaps zombies
