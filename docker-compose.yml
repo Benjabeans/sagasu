@@ -1,0 +1,75 @@
+# Sagasu — one container = one browser session.
+#
+# This is the hand-written single-session skeleton; the future
+# `sagasu session start` CLI templates the same shape per session (service name,
+# profile volume, published CDP port).
+#
+# Security model in one line: the session's internals (VNC, CDP) never leave
+# loopback / the compose network, and the panel — not the session — is what
+# carries the human credential. See README "Principles" / "Network model".
+
+services:
+  session:
+    image: sagasu/session:dev
+    hostname: sagasu-session
+
+    # Chromium renderers mmap /dev/shm hard; Docker's 64MB default produces
+    # "Aw, Snap" tab crashes. Preferred over --disable-dev-shm-usage, which
+    # pushes that traffic onto disk instead.
+    shm_size: "1gb"
+
+    # Keeps Chromium's user-namespace sandbox ON for an unprivileged user with
+    # NO cap_add and NO privileged. The profile is Moby's default seccomp
+    # profile with clone/clone3/unshare/setns moved from the CAP_SYS_ADMIN-gated
+    # rule into the unconditional allow list (we grant no capabilities, so the
+    # gated rule never fires); everything else is byte-identical to upstream.
+    # Source: https://github.com/moby/profiles/blob/main/seccomp/default.json
+    #   commit 3c28324314729dbade8287e868eef6338c42807a (2026-05-06)
+    # Why it matters: profiles hold real auth state — --no-sandbox plus one
+    # renderer exploit reads /profile. Escape hatch: SAGASU_NO_SANDBOX=1.
+    # The path is relative to this file; Compose reads it and ships the contents
+    # to the daemon.
+    security_opt:
+      - seccomp=./docker/seccomp-chrome.json
+
+    ports:
+      # CDP, agent-facing. This bind MUST stay on 127.0.0.1 — an open CDP port
+      # is unauthenticated, total control of a browser holding logged-in
+      # sessions. Never "9222:9222", never 0.0.0.0, never a LAN address.
+      - "127.0.0.1:9222:9222"
+      #
+      # noVNC (6080) is deliberately NOT published. VNC runs with
+      # SecurityTypes None precisely because it is only reachable inside the
+      # compose network, so publishing it would put an unauthenticated remote
+      # desktop on the host. The panel reaches this session at
+      # http://session:6080 over the compose network and authenticates the
+      # human itself.
+      # Debug only — uncomment to open noVNC from a host browser:
+      # - "127.0.0.1:6080:6080"
+      #
+      # VNC 5901 is published nowhere at all: websockify reaches it on
+      # container loopback, in-namespace.
+
+    volumes:
+      # Named, persistent profile — cookies, sessions, trusted-device state.
+      # Sensitive by design (README "Sessions are sensitive"): named so it can
+      # be scoped and destroyed deliberately, never baked into the image, and
+      # never an anonymous volume.
+      - sagasu-profile-default:/profile
+
+    environment:
+      START_URL: "${START_URL:-about:blank}"
+      SCREEN_GEOMETRY: "${SCREEN_GEOMETRY:-1366x768}"
+
+    # Session end == browser exit, by design: when the browser (or any session
+    # component) dies the container ends, and the CLI treats that as the session
+    # being over. Restarting would silently resurrect a session nobody owns.
+    restart: "no"
+
+    # On stop, the session traps TERM, kills the browser first and waits, so
+    # cookie/session databases flush before the container dies. This is that
+    # flush budget.
+    stop_grace_period: 15s
+
+volumes:
+  sagasu-profile-default:
