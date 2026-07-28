@@ -11,6 +11,9 @@
 services:
   session:
     image: sagasu/session:dev
+    # Temporary development address until `sagasu session start` assigns each
+    # container its UUID label.
+    container_name: sagasu-preview
     hostname: sagasu-session
 
     # Chromium renderers mmap /dev/shm hard; Docker's 64MB default produces

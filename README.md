@@ -115,6 +115,37 @@ The skill md teaches an agent *when* to reach for these commands and the safety 
 
 One learned rule rides along: text entry into CJK pages goes through CDP `Input.insertText` after an X-level click establishes focus — X keyboard input is keymap-bound and unreliable for 中文.
 
+### Current X-control commands
+
+The implemented X-control slice uses a UUID4 session label
+(`computer.sagasu.session.id=<uuid>`) to find exactly one running container:
+
+```text
+sagasu session display SESSION
+sagasu session screenshot SESSION --out PATH [--no-pointer] [--overwrite]
+sagasu session cursor SESSION position
+sagasu session cursor SESSION move X Y [--duration-ms N] [--steady]
+sagasu session cursor SESSION click X Y [--button BUTTON] [--count N] [--hold-ms N]
+sagasu session cursor SESSION drag X1 Y1 X2 Y2 [--duration-ms N] [--steady]
+sagasu session cursor SESSION scroll X Y --steps N
+```
+
+HumanCursor is the default input backend. `--backend xdotool` opts into the
+low-level fallback; failures never switch backends implicitly. Coordinates are
+integer pixels in the full-display screenshot space and out-of-bounds values
+fail rather than being clamped. Positive scroll steps move upward.
+
+For development containers that predate lifecycle labels, replace `SESSION`
+with `--container sagasu-preview`. `click`, `drag`, and `scroll` also have a
+debug-only `--current` escape hatch; normal automation should always include
+coordinates so movement and action happen under the same session lock.
+
+Non-image commands print structured JSON. Screenshots include the pointer by
+default, stream directly from the container, and are validated before being
+atomically published at `--out`. A per-container nonblocking lock prevents two
+agents from driving the same cursor; observation takes a shared lock, while
+movement takes an exclusive lock.
+
 The design rule that keeps the CLI honest: **it only automates what has exactly one correct way to be done** — container lifecycle, port/volume wiring, screenshots, X input delivery, CDP utility verbs, and queue registration. It is an on-ramp, not a gatekeeper: everything requiring judgment (what to click, when to hand off, which page state matters) stays with the agent, while the skill keeps the transport choice consistent — X input by default, CDP when the operation is inherently structured.
 
 ## Repository layout

@@ -156,8 +156,10 @@ RUN printf '%s\n' \
       python3-venv \
       python3-numpy \
       python3-pil \
+      python3-setuptools \
       python3-tk \
       python3-xlib \
+      python3-wheel \
       tini \
       ca-certificates \
       fontconfig \
@@ -220,9 +222,9 @@ COPY --from=fetcher /opt/novnc /usr/share/novnc
 # here with tight permissions is what makes profile volumes safe by default.
 RUN groupadd -g "${SAGASU_GID}" sagasu \
  && useradd -u "${SAGASU_UID}" -g "${SAGASU_GID}" -m -d /home/sagasu -s /usr/sbin/nologin sagasu \
- && mkdir -p /profile \
- && chown sagasu:sagasu /profile /home/sagasu \
- && chmod 700 /profile /home/sagasu
+ && mkdir -p /profile /run/sagasu \
+ && chown sagasu:sagasu /profile /home/sagasu /run/sagasu \
+ && chmod 700 /profile /home/sagasu /run/sagasu
 
 # --- browser payload -------------------------------------------------------
 # Empty directory in the chromium variant; removed by the step below.
@@ -248,6 +250,23 @@ RUN if [ "${BROWSER}" != "helium" ]; then \
     done; \
     if [ -e /opt/helium/chrome-sandbox ]; then chmod 4755 /opt/helium/chrome-sandbox; fi; \
     /usr/bin/helium --version
+
+# --- X-control executor ----------------------------------------------------
+# The host CLI and private executor intentionally ship as one distribution.
+# Install it into HumanCursor's venv so the executor imports the exact pinned
+# HumanCursor/PyAutoGUI stack above, then expose only the private entry point on
+# the container's ordinary PATH for non-interactive `docker exec`.
+COPY pyproject.toml README.md /opt/sagasu-package/
+COPY src /opt/sagasu-package/src
+RUN /opt/sagasu-humancursor/bin/python -m pip install \
+      --disable-pip-version-check \
+      --no-cache-dir \
+      --no-build-isolation \
+      --no-deps \
+      /opt/sagasu-package \
+ && ln -sf /opt/sagasu-humancursor/bin/sagasu-xcontrol \
+      /usr/local/bin/sagasu-xcontrol \
+ && test -x /usr/local/bin/sagasu-xcontrol
 
 # --- session scripts -------------------------------------------------------
 # chmod is explicit rather than `COPY --chmod` so the image also builds on the
