@@ -4,6 +4,8 @@
 
 Sagasu gives headless agents a way to hand a live browser session to a human — for CAPTCHAs, logins, 2FA, or anything else an agent shouldn't (or can't) do itself — and then take the session back and keep working: a reproducible, multi-agent, multi-session system with a single place for humans to service requests.
 
+Sagasu is an **X-input-first browser skill**. An agent's normal loop is to capture the full X11 display, reason over what is visibly on screen, and drive the real cursor and keyboard through the session's X server. CDP is a supplemental channel for operations that are more direct or reliable as browser commands — opening a URL, waiting for navigation, inspecting the DOM or accessibility tree, inserting Unicode text, attaching a file, and managing cookies. CDP and the DOM inform or shortcut the interaction; they are not the default clicking path.
+
 ## The problem
 
 Agents doing real work on the web constantly hit walls that require a human: CAPTCHA challenges, SSO logins, 2FA prompts, consent screens. And the ways agents browse the web today — including the existing human-handoff tools — have structural problems:
@@ -36,11 +38,11 @@ flowchart TB
     H[Human] --> P
 ```
 
-Four layers, together answering those problems: browsers run in containers off to the side (your device stays yours, sessions scale horizontally), state persists in named profiles, and every human ask lands in one queue.
+Four layers, together answering those problems: browsers run in containers off to the side (your device stays yours, sessions scale horizontally), state persists in named profiles, and every human ask lands in one queue. Inside each browser session, both agent and human act on the same X11 display and cursor; the agent additionally has a private, loopback-only CDP side channel for structured browser operations.
 
 ### 1. Docker runtime — reproducibility
 
-The entire browser stack (Xvfb, window manager, browser, x11vnc, websockify/noVNC) lives in a container image. Any host that can run Docker can run Sagasu identically — no host package installs, no leftover processes, no per-distro pitfalls. Spinning up a new browser session is a container-level operation with isolated displays, ports, and profile volumes, so concurrent sessions can't collide.
+The entire browser stack (TigerVNC's Xvnc — virtual display and VNC server in one process — window manager, browser, X-level screenshot/input tools, and websockify/noVNC) lives in a container image. Any host that can run Docker can run Sagasu identically — no host package installs, no leftover processes, no per-distro pitfalls. Spinning up a new browser session is a container-level operation with isolated displays, cursors, ports, and profile volumes, so concurrent sessions can't collide.
 
 The browser itself is a configuration choice, not a hardcoded dependency. The default is **[Helium](https://github.com/imput/helium)** — a lightweight, privacy-focused Chromium fork that keeps the image small — with stock Chromium (or any Chromium-family browser that exposes CDP) as an alternative.
 
@@ -48,16 +50,21 @@ The browser itself is a configuration choice, not a hardcoded dependency. The de
 
 Browser sessions are launched against **named, persistent profiles** stored on volumes. When a human logs into a site once, that authenticated state (cookies, sessions) survives the container and is reusable by any agent on subsequent tasks. Log in to a service on Monday; agents keep working inside that session all week. Profiles are treated as sensitive material: they never leave the host's network boundary and are never baked into images.
 
-### 3. Browser sessions — one per agent task
+### 3. Browser sessions — X input first, CDP second
 
-Each agent request gets its own browser with two faces:
+Each agent request gets its own session container: a real X11 desktop with one browser on it, driven **computer-use style**. The default interaction contract is deliberately asymmetric:
 
-- **CDP endpoint** (agent-facing): the agent drives the browser programmatically before and after the human steps in.
-- **noVNC view** (human-facing): the same live session, viewable and controllable from a web page when handoff is needed.
+- **Full-display screenshots + X11-level input** (agent-facing, primary): the agent sees the entire display — page, tab strip, extension buttons, browser popups — and acts through the display's real cursor and keyboard focus. Everything a human can click, the agent can click, browser chrome included.
+- **CDP endpoint** (agent-facing, supplemental): the structured side channel. CDP navigates directly to URLs, waits on page lifecycle events, inserts text that X keyboard mapping cannot express reliably, handles uploads and cookies, and exposes the DOM and accessibility tree for semantic grounding.
+- **noVNC view** (human-facing): the same live display, viewable and controllable from a web page when handoff is needed.
 
-The agent and the human are looking at — and taking turns driving — the *same* browser. That is the core trick, and it's what makes "human solves the CAPTCHA, agent continues the job" seamless.
+The agent and the human are looking at — and taking turns driving — the *same* browser through the *same* screen and cursor. That is the core trick: it's what makes "human solves the CAPTCHA, agent continues the job" seamless, and it makes a handoff nothing more than the agent going hands-off while the human works.
 
-**Screenshots are a first-class agent capability — and the expected first move.** Since every session already has a rendered display, the agent can capture the browser window at any time and *see* the page the way the human would. The intended workflow is look-first: screenshot to understand what's actually on screen (layout, modals, error banners, a CAPTCHA that just appeared), then act programmatically via CDP — rather than diving DOM-first into a page it has never seen. This also makes handoffs smarter: an agent that can see a challenge widget knows to enqueue a `captcha` request instead of fumbling selectors against it.
+The default rule is: **see through the X display, act through X input, and use CDP only as a supplement.** Routine pointing, clicking, hovering, dragging, scrolling, and keyboard interaction go through the X cursor and focused window — not `Runtime.evaluate("element.click()")` or CDP mouse events. The DOM may identify an element and provide its viewport box, but the resulting action is translated into display coordinates and performed through X input.
+
+**On session start, the agent is handed both the picture and the structure.** `session start` returns an initial full-display screenshot together with a DOM snapshot, so the agent begins with visual understanding plus supplemental semantic context. The working loop stays X-first from there: capture the display, determine what is visibly happening, optionally consult the DOM to ground a target, act through the X cursor or keyboard, then capture the display again to verify the outcome. Direct CDP verbs are reserved for operations such as `Page.navigate`, lifecycle waits, file attachment, cookie access, and `Input.insertText` for Unicode text. This also makes handoffs smarter: an agent that can see a challenge widget knows to enqueue a `captcha` request instead of fumbling selectors against it.
+
+**Session modes.** The default is one task per container — each session has its own display, cursor, browser, and egress identity, so parallel agents never contend for input. For workloads where several subagents must work the *same logged-in site at the same time*, an opt-in shared-session mode is planned: one container, one browser, multiple windows — cookies and logins shared live across every window, each window driven by its own CDP session. That mode is an explicit exception to the X-input-first contract because one X display cannot provide an independent physical cursor per window. The verified mechanics and trade-offs are in [Problems.md](./Problems.md).
 
 ### 4. Centralized panel — the human's single pane of glass
 
@@ -87,16 +94,28 @@ Agents interact with Sagasu through a small CLI (driven via shell) documented by
 ```
 sagasu setup                                                   # interactive first-run: browser, network, storage, panel
 sagasu config [get|set <key> [value]]                          # view or change configuration after setup
-sagasu session start [--profile <name>] [--url <start-url>]   # launch a browser, print CDP endpoint + session id
-sagasu session screenshot <session-id> [--out <path>]          # capture the rendered window for visual inspection
+sagasu session start [--profile <name>] [--url <start-url>]   # launch a session; print session id + CDP side channel
+                                                               #   and return an initial screenshot + DOM snapshot
+sagasu session screenshot <session-id> [--out <path>]          # capture the full display, browser chrome included
+sagasu session cursor <session-id> move|click|drag ...          # primary: drive the real X cursor
+sagasu session key <session-id> press|type ...                  # primary: send input to the X-focused window
+sagasu session navigate <session-id> <url>                      # supplemental: direct CDP navigation
+sagasu session insert-text <session-id> <text>                  # supplemental: CDP Unicode text insertion
 sagasu handoff request <session-id> --type captcha|login|other --note "..."   # enqueue for the human, block or poll
 sagasu handoff status <session-id>                             # has the human resolved it?
 sagasu session stop <session-id>                               # tear down (profile persists)
 ```
 
-The skill md teaches an agent *when* to reach for these commands and the safety rules around them. Its install flow points at `sagasu setup` as the mandatory first step, and its workflow guidance tells agents to screenshot before scripting — visual understanding first, CDP second.
+The skill md teaches an agent *when* to reach for these commands and the safety rules around them. Its install flow points at `sagasu setup` as the mandatory first step, and its workflow guidance encodes the interaction hierarchy:
 
-The design rule that keeps the CLI honest: **it only automates what has exactly one correct way to be done** — container lifecycle, port/volume wiring, screenshots, queue registration. It is an on-ramp, not a gatekeeper: `session start` prints the CDP endpoint and gets out of the way, and everything requiring judgment (what to click, when to hand off, which URL to open) stays with the agent talking CDP directly to the browser.
+1. **X display for observation** — capture the whole screen, including browser chrome and overlays.
+2. **X input for normal action** — use the real cursor and focused keyboard for clicks, drags, scrolling, and ordinary typing.
+3. **DOM/accessibility for supplemental grounding** — use structure to understand or locate what the screenshot shows, never as the default action mechanism.
+4. **CDP for supplemental browser verbs** — navigate directly, wait for lifecycle events, insert Unicode text, attach files, and manage browser state.
+
+One learned rule rides along: text entry into CJK pages goes through CDP `Input.insertText` after an X-level click establishes focus — X keyboard input is keymap-bound and unreliable for 中文.
+
+The design rule that keeps the CLI honest: **it only automates what has exactly one correct way to be done** — container lifecycle, port/volume wiring, screenshots, X input delivery, CDP utility verbs, and queue registration. It is an on-ramp, not a gatekeeper: everything requiring judgment (what to click, when to hand off, which page state matters) stays with the agent, while the skill keeps the transport choice consistent — X input by default, CDP when the operation is inherently structured.
 
 ## Repository layout
 
@@ -104,16 +123,18 @@ The repo contains everything needed to go from `git clone` to a working deployme
 
 ```
 sagasu/
-├── Dockerfile            # the system environment: Xvfb, window manager, browser
-│                         # (Helium by default), x11vnc, websockify/noVNC
+├── Dockerfile            # the system environment: TigerVNC (Xvnc), openbox, browser
+│                         # (Helium by default, GPG-verified), websockify + vendored noVNC
+├── docker/               # session-container internals: entrypoint + supervisor scripts,
+│                         # healthcheck, sandbox seccomp profile, Helium signing key
 ├── docker-compose.yml    # one-command wiring: container, profile volumes, ports,
 │                         # network boundary binding
 ├── panel/                # control panel: FIFO intervention queue, type filters,
 │                         # embedded noVNC dashboard
 ├── cli/                  # the sagasu CLI — session lifecycle, screenshots,
-│                         # handoff plumbing (browser control stays raw CDP)
+│                         # X input, supplemental CDP verbs, handoff plumbing
 ├── skill.md              # instructions to the LLM: when to use sagasu, the
-│                         # screenshot-first workflow, safety rules
+│                         # X-input-first workflow, CDP boundaries, safety rules
 └── docs/                 # worked agent examples: captcha-handoff walkthrough,
                           # login-once/reuse-profile flow, troubleshooting
 ```
@@ -128,6 +149,7 @@ The boundary remains a deployment choice, not an assumption baked into the code 
 
 ## Principles
 
+- **X input is primary.** The agent normally observes the full X display and acts through its real cursor and keyboard. CDP supplies direct navigation, semantic context, and browser-native utility operations; it does not replace the default screen-and-cursor loop.
 - **Handoff, not bypass.** Sagasu lets a human complete challenges in an agent-controlled browser. It does not and will not automate CAPTCHA solving or circumvent site protections.
 - **Humans own their secrets.** Agents never ask for, read, or handle passwords and 2FA codes — they open the page and step aside.
 - **Never public.** VNC/CDP internals are never exposed beyond localhost; the human-facing surface is never exposed beyond the configured boundary.
@@ -135,6 +157,6 @@ The boundary remains a deployment choice, not an assumption baked into the code 
 
 ## Status
 
-Early design — this README is the direction; the components are not built yet.
+The session container is built: Dockerfile + compose file with Helium (GPG-verified download), TigerVNC, X-level input and display-capture tools (`xdotool` + `scrot`), vendored noVNC, a sandbox-on seccomp profile, and loopback-only internals — verified end-to-end (healthy under compose, CDP reachable from the host only on loopback, clean browser-first shutdown, CJK rendering).
 
-Rough build order: containerize the browser stack (Helium default) with the Dockerfile + compose file → `setup`/`config` flow → session lifecycle CLI with named profiles → intervention queue + panel → embedded noVNC and agent-resume signaling → skill.md + docs written against the working system.
+Remaining build order: `setup`/`config` flow → session lifecycle CLI with named profiles and the X-level screenshot/input plumbing → intervention queue + panel → embedded noVNC and agent-resume signaling → skill.md + docs written against the working system.

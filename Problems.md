@@ -42,7 +42,34 @@ Sagasu containers carry live authenticated sessions, so a leaked port is account
 
 - **Profile locking.** A Chromium profile directory can only be open in one browser instance at a time. Two agents requesting sessions on the same named profile must either queue, share the running instance (separate tabs — with which isolation guarantees?), or fail loudly. Needs an explicit policy in the CLI.
 - **Agent harness attach limitations.** Some agent frameworks' built-in browser tools can't attach to an external CDP endpoint and insist on launching their own browser. The skill must be explicit that the agent drives Sagasu's browser via raw CDP (or a CDP-capable library), not via its harness's browser tool.
-- **Input collision.** Agent CDP commands landing while the human is mid-drag on a slider captcha would corrupt the very trajectory being scored. Handoff should imply the agent pauses driving until resolution — convention at minimum, enforcement (queue state gates CDP proxying?) if it proves necessary.
+- **Input collision.** Agent input landing while the human is mid-drag on a slider captcha would corrupt the very trajectory being scored — and with the X-level interaction model the agent and the human share the literal cursor, so this is physical, not just a protocol quirk. Handoff must imply the agent freezes all driving until resolution — a hard rule in skill.md at minimum, enforcement (queue state gates input?) if it proves necessary. See "One cursor per display" below.
+
+## Blocker detection is iframe-blind in the DOM
+
+Observed in a live Taobao run: an image-select captcha covered the entire results page while `document.body.innerText` in the main frame reported no captcha at all — the overlay's content lives in a child iframe (cross-origin ones are separate CDP targets entirely), which `Runtime.evaluate` in the main frame cannot see into. A DOM-only "am I blocked?" check returns a false negative at exactly the moment it matters. Consequences:
+
+- **The screenshot is the authoritative blocker detector** — vision sees what the main-frame DOM hides. skill.md should teach: when deciding whether the page is blocked, trust the pixels over the DOM.
+- DOM-side detection, where used, must enumerate frames (`Page.getFrameTree`, and `Target.getTargets` for out-of-process iframes) rather than querying the main document.
+- The same caveat applies to auto-resolve heuristics in [resume signaling](#resume-signaling): "challenge iframe gone" has to be checked at the frame level, not against the main document.
+
+## One cursor per display — the interaction and concurrency model
+
+The agent's primary interface is computer-use style: full-display screenshots (browser chrome included) and OS-level X input, with the DOM as an information supplement and CDP verbs for navigation and machine operations. Cheap to build — `xdotool` + `scrot` add under 1MB to the image — but the choice has consequences that shape the session model:
+
+- **X input is a shared resource.** A display has one cursor and one keyboard focus. Within a container, exactly one actor can drive at a time — agent, human, or another agent. Parallelism therefore lives at the container level (one task per container, each with its own display and cursor), never inside a session.
+- **Two coordinate spaces.** Display coordinates (X screenshots, X input) and viewport coordinates (CDP screenshots, CDP input, DOM boxes) are each internally 1:1 — the container runs at `devicePixelRatio` 1 — but differ by a fixed offset: window position plus the browser-chrome band (`window.screenX/screenY`, `outerHeight − innerHeight`). Mixing a screenshot from one space with a click in the other silently misclicks. The skill must keep the pairings straight and supply the offset for the best targeting pattern: locate the element in the DOM, translate its box to display coordinates, click it with real X input.
+- **CJK text entry.** `xdotool type` is keymap-bound and unreliable for CJK — a real gap given the Chinese-web goal. Rule: establish focus with an X click, then insert text via CDP `Input.insertText` (verified working with 中文 in the built image).
+- **Focus follows input.** Keyboard events go to the X-focused window, and clicks establish focus — the agent must click before typing, like a human does.
+
+### The shared-login multi-window mode (assessed, deferred)
+
+For subagents that need the *same logged-in site simultaneously*, a second session mode was verified empirically in the built image: one container, one browser, N windows (`Target.createTarget` with `newWindow: true`), each window driven by its own CDP session over the single CDP endpoint. Findings from the live experiment:
+
+- **Live login sharing works.** A cookie set in one window is instantly visible in every other — one instance, one jar. This also sidesteps the profile-lock problem by funneling concurrency into one browser, and avoids sites that invalidate concurrent logins to the same account.
+- **Occlusion is the trap.** A fully covered window goes `visibilityState: hidden`, stops painting (stale screenshots), and drops CDP mouse events. Three flags fix all of it — verified: fresh screenshots and `isTrusted` clicks landed in a fully occluded window — `--disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling` (they ride the image's `BROWSER_EXTRA_ARGS`).
+- **Browser-internal focus flips.** Driving window A makes other windows see `document.hasFocus() === false` even though X focus is untouched. Harmless between agents; one more reason the handoff freeze rule is fleet-wide within a session.
+- **"One window per noVNC view" is possible without multiple displays** (a browser instance cannot span X displays): run one large display, tile windows into fixed slots (`Browser.setWindowBounds` is pixel-exact), and export each slot as its own view with `x11vnc -clip` behind its own websockify path — spawned lazily only while a handoff on that window is active, so steady-state cost stays zero. Keyboard focus remains global: one human at a time per session container.
+- **Why it stays opt-in:** one crash domain and one identity for N tasks — per-*account* velocity becomes the limiting anti-bot factor — and input must be CDP-scoped per window, giving up the X-level interaction model, because N cursors don't exist on one display.
 
 ## Human input fidelity through VNC
 
