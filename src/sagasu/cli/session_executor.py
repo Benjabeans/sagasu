@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import BinaryIO, Sequence, TextIO
 
 from sagasu.cdp.dom import stream_active_dom
+from sagasu.cdp.insert_text import insert_text_active_page
+from sagasu.cdp.navigate import navigate_active_page
 from sagasu.protocol import SagasuError, success, write_json
 from sagasu.sessions import human_control
 from sagasu.sessions.locking import LOCK_PATH, session_lock
@@ -49,6 +51,17 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "dom", help="write the active page's live HTML DOM to stdout"
     )
+
+    navigate = commands.add_parser(
+        "navigate", help="navigate the active page through CDP"
+    )
+    navigate.add_argument("url")
+
+    insert_text = commands.add_parser(
+        "insert-text",
+        help="insert text into the focused page element through CDP",
+    )
+    insert_text.add_argument("text")
 
     cursor = commands.add_parser("cursor", help="inspect or mutate the cursor")
     cursor_commands = cursor.add_subparsers(
@@ -221,6 +234,15 @@ def execute(
         write_json(_result("display", "xdotool", display, pointer), text_stdout)
         return
 
+    if arguments.command in ("navigate", "insert-text"):
+        payload = _execute_cdp_mutation(
+            arguments,
+            lock_path=lock_path,
+            pause_path=pause_path,
+        )
+        write_json(payload, text_stdout)
+        return
+
     if arguments.command == "human":
         with session_lock(exclusive=True, path=lock_path):
             if arguments.human_command == "pause":
@@ -251,6 +273,39 @@ def execute(
         pause_path=pause_path,
     )
     write_json(payload, text_stdout)
+
+
+def _execute_cdp_mutation(
+    arguments: argparse.Namespace,
+    *,
+    lock_path: Path | str,
+    pause_path: Path | str,
+) -> dict[str, object]:
+    with session_lock(exclusive=True, path=lock_path):
+        human_control.require_agent_control(pause_path)
+        if arguments.command == "navigate":
+            result = navigate_active_page(arguments.url)
+            extra: dict[str, object] = {
+                "target_id": result.target_id,
+                "requested_url": result.requested_url,
+                "frame_id": result.frame_id,
+                "loader_id": result.loader_id,
+                "is_download": result.is_download,
+            }
+            operation = "page.navigate"
+        else:
+            result = insert_text_active_page(arguments.text)
+            extra = {
+                "target_id": result.target_id,
+                "title": result.title,
+                "url": result.url,
+                "characters": result.character_count,
+                "bytes": result.byte_count,
+            }
+            operation = "text.insert"
+        display = get_display_size()
+        pointer = get_pointer_position()
+    return _result(operation, "cdp", display, pointer, **extra)
 
 
 def _execute_mutation(

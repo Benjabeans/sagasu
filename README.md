@@ -124,6 +124,8 @@ The implemented X-control slice uses a UUID4 session label
 sagasu session display SESSION
 sagasu session screenshot SESSION --out PATH [--no-pointer] [--overwrite]
 sagasu session dom SESSION --out PATH [--overwrite]
+sagasu session navigate SESSION URL
+sagasu session insert-text SESSION TEXT
 sagasu session cursor SESSION position
 sagasu session cursor SESSION move X Y [--duration-ms N] [--steady]
 sagasu session cursor SESSION click X Y [--button BUTTON] [--count N] [--hold-ms N]
@@ -155,6 +157,15 @@ the document at `--out`. The returned JSON includes the page target ID, title,
 URL, byte count, display dimensions, and pointer position. This is the current
 top-level document markup: linked stylesheets remain links, computed styles are
 not inlined, and cross-origin iframe documents are not flattened into it.
+
+`session navigate` sends an absolute HTTP(S) URL to the active page with
+`Page.navigate`. It reports when Chromium accepts or rejects the navigation;
+it does not imply that the destination has finished loading, so capture a fresh
+screenshot and DOM afterward. `session insert-text` sends `Input.insertText`
+to the currently focused page element and supports Unicode without depending
+on the X keyboard map. Establish focus first with an X-level click and verify
+the visible result afterward. Both commands take the exclusive session lock
+and are blocked while control is paused for a human.
 
 The host invokes the private `sagasu-session-exec` entry point inside the
 resolved container. `sagasu-xcontrol` remains available as a compatibility
@@ -205,7 +216,8 @@ The boundary remains a deployment choice, not an assumption baked into the code 
 
 The session container is built: Dockerfile + compose file with Helium (GPG-verified download), TigerVNC, X-level input and display-capture tools (`xdotool` + `scrot`), vendored noVNC, a sandbox-on seccomp profile, and loopback-only internals — verified end-to-end (healthy under compose, CDP reachable from the host only on loopback, clean browser-first shutdown, CJK rendering).
 
-The current slice includes resolved-session display, screenshot, DOM, and
-mouse control. Remaining work includes `setup`/`config`, lifecycle management
-with named profiles, keyboard/CDP utility verbs, the intervention queue and
-panel, embedded noVNC resume signaling, and the finished agent skill/docs.
+The current slice includes resolved-session display, screenshot, DOM, mouse
+control, direct CDP navigation, and CDP Unicode text insertion. Remaining work
+includes `setup`/`config`, lifecycle management with named profiles, X keyboard
+control and additional CDP utility verbs, the intervention queue and panel,
+embedded noVNC resume signaling, and the finished agent skill/docs.

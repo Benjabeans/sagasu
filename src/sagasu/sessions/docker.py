@@ -175,7 +175,7 @@ class DockerCLI:
                 raise error
             raise SagasuError(
                 "input_failed",
-                "The in-container X-control command failed",
+                "The in-container session-control command failed",
                 {
                     "container_id": container_id,
                     "reason": self._stderr(completed),

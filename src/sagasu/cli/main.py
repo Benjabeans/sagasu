@@ -77,6 +77,18 @@ def build_parser() -> argparse.ArgumentParser:
     dom.add_argument("--out", required=True)
     dom.add_argument("--overwrite", action="store_true")
 
+    navigate = session_commands.add_parser(
+        "navigate", help="navigate the active page through CDP"
+    )
+    _add_target(navigate)
+    navigate.add_argument("url")
+
+    insert_text = session_commands.add_parser(
+        "insert-text", help="insert text into the focused page element through CDP"
+    )
+    _add_target(insert_text)
+    insert_text.add_argument("text")
+
     cursor = session_commands.add_parser(
         "cursor", help="inspect or drive the real X cursor"
     )

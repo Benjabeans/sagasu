@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import BinaryIO, Mapping, Sequence
+from typing import BinaryIO, Mapping
 
 from sagasu.artifacts.html import MAX_HTML_BYTES
 from sagasu.cdp.client import (
@@ -13,6 +13,7 @@ from sagasu.cdp.client import (
     PageTarget,
     TargetLoader,
 )
+from sagasu.cdp.targets import select_active_page
 from sagasu.protocol import SagasuError
 
 
@@ -95,7 +96,7 @@ def capture_active_dom(
         connector=connector,
     )
     targets = active_client.page_targets()
-    selected = _select_active_target(targets, client=active_client)
+    selected = select_active_page(targets, client=active_client)
     html = _outer_html(selected, client=active_client)
     return DOMSnapshot(
         html=html,
@@ -104,47 +105,6 @@ def capture_active_dom(
         url=selected.url,
         byte_count=len(html.encode("utf-8")),
     )
-
-
-def _select_active_target(
-    targets: Sequence[PageTarget],
-    *,
-    client: CDPClient,
-) -> PageTarget:
-    if len(targets) == 1:
-        return targets[0]
-
-    visible: list[PageTarget] = []
-    for target in targets:
-        with client.open(target) as session:
-            result = session.call(
-                "Runtime.evaluate",
-                {
-                    "expression": "document.visibilityState",
-                    "returnByValue": True,
-                },
-            )
-        remote_object = result.get("result")
-        if (
-            isinstance(remote_object, Mapping)
-            and remote_object.get("value") == "visible"
-        ):
-            visible.append(target)
-
-    if len(visible) == 1:
-        return visible[0]
-    if not visible:
-        raise SagasuError(
-            "dom_target_not_found",
-            "No browser page is currently visible",
-            {"page_targets": len(targets)},
-        )
-    raise SagasuError(
-        "dom_target_ambiguous",
-        "More than one browser page is currently visible",
-        {"target_ids": [target.target_id for target in visible]},
-    )
-
 
 def _outer_html(target: PageTarget, *, client: CDPClient) -> str:
     with client.open(target) as session:
@@ -170,4 +130,3 @@ def _outer_html(target: PageTarget, *, client: CDPClient) -> str:
             "CDP returned an invalid serialized DOM",
         )
     return html
-
