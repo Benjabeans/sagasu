@@ -7,9 +7,9 @@ import sys
 from typing import Sequence
 
 from sagasu import __version__
-from sagasu.cli import session_xcontrol
-from sagasu.sessions.docker_cli import DockerCLI
-from sagasu.xcontrol.protocol import SagasuError, write_json
+from sagasu.cli import session
+from sagasu.protocol import SagasuError, write_json
+from sagasu.sessions.docker import DockerCLI
 
 
 class ProtocolArgumentParser(argparse.ArgumentParser):
@@ -69,6 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
     screenshot.add_argument("--out", required=True)
     screenshot.add_argument("--no-pointer", action="store_true")
     screenshot.add_argument("--overwrite", action="store_true")
+
+    dom = session_commands.add_parser(
+        "dom", help="save the active page's live HTML DOM"
+    )
+    _add_target(dom)
+    dom.add_argument("--out", required=True)
+    dom.add_argument("--overwrite", action="store_true")
 
     cursor = session_commands.add_parser(
         "cursor", help="inspect or drive the real X cursor"
@@ -145,7 +152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"Unsupported command {arguments.command!r}",
                 exit_status=2,
             )
-        payload = session_xcontrol.run(arguments, DockerCLI())
+        payload = session.run(arguments, DockerCLI())
         write_json(payload, sys.stdout)
         return 0
     except SagasuError as error:
