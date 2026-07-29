@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+#
+# Sagasu session healthcheck — zero dependencies beyond bash + coreutils.
+#
+# Two checks, in order of cheapness:
+#   1. the X socket exists (display up)
+#   2. GET /json/version through the socat relay returns browser JSON, which
+#      exercises the exact path an agent uses: socat -> browser CDP
+#
+# Note the literal `Host: 127.0.0.1`. Chromium's DevTools HTTP endpoint rejects
+# requests whose Host header is not an IP or localhost, so CDP must always be
+# addressed by IP — the same gotcha the CLI has to respect.
+#
+set -uo pipefail
+
+: "${DISPLAY:=:1}"
+: "${CDP_PORT:=9222}"
+: "${HEALTHCHECK_TIMEOUT:=4}"
+
+display_num="${DISPLAY#:}"
+display_num="${display_num%%.*}"
+x_socket="/tmp/.X11-unix/X${display_num}"
+
+if [[ ! -S "${x_socket}" ]]; then
+    echo "unhealthy: no X socket at ${x_socket}"
+    exit 1
+fi
+
+if ! exec 3<>"/dev/tcp/127.0.0.1/${CDP_PORT}"; then
+    echo "unhealthy: cannot connect to the CDP relay on 127.0.0.1:${CDP_PORT}"
+    exit 1
+fi
+
+printf 'GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n' >&3
+
+response="$(timeout "${HEALTHCHECK_TIMEOUT}" cat <&3)"
+exec 3<&- 3>&-
+
+if [[ "${response}" != *'"Browser"'* ]]; then
+    echo "unhealthy: /json/version did not return browser JSON"
+    exit 1
+fi
+
+browser="$(grep -o '"Browser"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"${response}" | head -n1 | cut -d'"' -f4)"
+echo "healthy: ${browser:-CDP responding}"
+exit 0

@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+#
+# Sagasu session supervisor — crash-only, no init system.
+#
+# Starts the four support processes and the browser in the background and then
+# blocks on `wait -n`. ANY of them exiting ends the container: the browser
+# closing means the session is over, by design. On SIGTERM the browser is
+# stopped FIRST and waited for, so its cookie/session databases flush before
+# the display disappears (compose grants stop_grace_period for this).
+#
+set -euo pipefail
+
+log() { printf '[sagasu/session] %s\n' "$*" >&2; }
+die() { log "FATAL: $*"; exit 1; }
+
+: "${DISPLAY:=:1}"
+: "${SCREEN_GEOMETRY:=1366x768}"
+: "${SCREEN_DEPTH:=24}"
+: "${START_URL:=about:blank}"
+: "${PROFILE_DIR:=/profile}"
+: "${VNC_PORT:=5901}"
+: "${NOVNC_PORT:=6080}"
+: "${NOVNC_ROOT:=/usr/share/novnc}"
+: "${CDP_PORT:=9222}"
+: "${CDP_INTERNAL_PORT:=9229}"
+: "${BROWSER_BIN:=/usr/bin/helium}"
+: "${BROWSER_EXTRA_ARGS:=}"
+: "${SAGASU_NO_SANDBOX:=}"
+: "${X_STARTUP_TIMEOUT:=15}"
+: "${BROWSER_STOP_TIMEOUT:=10}"
+
+display_num="${DISPLAY#:}"
+display_num="${display_num%%.*}"
+x_socket="/tmp/.X11-unix/X${display_num}"
+
+browser_pid=""
+aux_pids=()
+shutting_down=0
+
+# --- teardown --------------------------------------------------------------
+stop_pid() {
+    local pid="$1" deadline="$2" waited=0
+    kill -0 "${pid}" 2>/dev/null || return 0
+    kill -TERM "${pid}" 2>/dev/null || true
+    while kill -0 "${pid}" 2>/dev/null; do
+        if (( waited >= deadline * 10 )); then
+            log "pid ${pid} ignored SIGTERM after ${deadline}s; sending SIGKILL"
+            kill -KILL "${pid}" 2>/dev/null || true
+            break
+        fi
+        sleep 0.1
+        waited=$(( waited + 1 ))
+    done
+}
+
+teardown() {
+    local exit_code="$1"
+    (( shutting_down )) && return 0
+    shutting_down=1
+    trap - TERM INT
+
+    # Browser first, and wait for it: everything below it (X, VNC) vanishing
+    # mid-write is how profiles get corrupted.
+    if [[ -n "${browser_pid}" ]]; then
+        log "stopping the browser (pid ${browser_pid}) and letting it flush"
+        stop_pid "${browser_pid}" "${BROWSER_STOP_TIMEOUT}"
+    fi
+
+    local pid
+    for pid in "${aux_pids[@]}"; do
+        stop_pid "${pid}" 3
+    done
+
+    log "session stopped (exit ${exit_code})"
+    exit "${exit_code}"
+}
+
+trap 'log "received SIGTERM"; teardown 0' TERM
+trap 'log "received SIGINT";  teardown 0' INT
+
+# --- 1. Xvnc: X server + VNC server in one process -------------------------
+# -localhost yes keeps 5901 on container loopback; websockify reaches it
+# in-namespace, so the VNC port is never published anywhere. SecurityTypes
+# None is the deliberate consequence: the panel carries the human credential.
+# -s 0 / -dpms stop the screen blanking that would hand a black frame to a
+# human arriving to solve a captcha.
+log "starting Xvnc on ${DISPLAY} (${SCREEN_GEOMETRY}x${SCREEN_DEPTH}, rfb ${VNC_PORT} loopback-only)"
+Xtigervnc "${DISPLAY}" \
+    -geometry "${SCREEN_GEOMETRY}" \
+    -depth "${SCREEN_DEPTH}" \
+    -rfbport "${VNC_PORT}" \
+    -localhost yes \
+    -SecurityTypes None \
+    -AlwaysShared \
+    -desktop sagasu \
+    -nolisten tcp \
+    -s 0 \
+    -dpms &
+xvnc_pid=$!
+aux_pids+=( "${xvnc_pid}" )
+
+waited=0
+until [[ -S "${x_socket}" ]]; do
+    kill -0 "${xvnc_pid}" 2>/dev/null || die "Xvnc exited before the display came up"
+    if (( waited >= X_STARTUP_TIMEOUT * 10 )); then
+        die "no X socket at ${x_socket} after ${X_STARTUP_TIMEOUT}s"
+    fi
+    sleep 0.1
+    waited=$(( waited + 1 ))
+done
+log "display ${DISPLAY} ready"
+
+# --- 2. window manager -----------------------------------------------------
+log "starting openbox"
+openbox &
+aux_pids+=( "$!" )
+
+# --- 3. noVNC over websockify ----------------------------------------------
+# 0.0.0.0 inside the container namespace only — 6080 is unpublished by default
+# and reached as session:6080 over the compose network.
+log "starting websockify on :${NOVNC_PORT} -> 127.0.0.1:${VNC_PORT} (web root ${NOVNC_ROOT})"
+websockify --web="${NOVNC_ROOT}" --heartbeat=30 "0.0.0.0:${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" &
+aux_pids+=( "$!" )
+
+# --- 4. CDP relay ----------------------------------------------------------
+# Headful Chromium ignores --remote-debugging-address (headless-only) and pins
+# CDP to container loopback, which `docker -p` cannot reach. socat is the
+# bridge, not an optimisation.
+log "starting socat CDP relay :${CDP_PORT} -> 127.0.0.1:${CDP_INTERNAL_PORT}"
+socat "TCP-LISTEN:${CDP_PORT},fork,reuseaddr" "TCP:127.0.0.1:${CDP_INTERNAL_PORT}" &
+aux_pids+=( "$!" )
+
+# --- 5. browser ------------------------------------------------------------
+[[ -x "${BROWSER_BIN}" ]] || die "BROWSER_BIN=${BROWSER_BIN} is not executable"
+
+browser_args=(
+    --user-data-dir="${PROFILE_DIR}"
+    --remote-debugging-port="${CDP_INTERNAL_PORT}"
+    --no-first-run
+    --no-default-browser-check
+    # No dbus daemon in this image, so the default gnome-keyring/kwallet
+    # backends would hang on startup.
+    --password-store=basic
+    --window-position=0,0
+    --window-size="${SCREEN_GEOMETRY/x/,}"
+)
+
+if [[ -n "${SAGASU_NO_SANDBOX}" && "${SAGASU_NO_SANDBOX}" != "0" ]]; then
+    log "WARNING: SAGASU_NO_SANDBOX is set — running without the Chromium sandbox."
+    log "WARNING: a renderer compromise can then read every credential in ${PROFILE_DIR}."
+    browser_args+=( --no-sandbox )
+fi
+
+extra_args=()
+if [[ -n "${BROWSER_EXTRA_ARGS}" ]]; then
+    read -r -a extra_args <<< "${BROWSER_EXTRA_ARGS}"
+fi
+
+log "starting browser ${BROWSER_BIN} (profile ${PROFILE_DIR}, cdp 127.0.0.1:${CDP_INTERNAL_PORT})"
+"${BROWSER_BIN}" "${browser_args[@]}" "${extra_args[@]}" "${START_URL}" &
+browser_pid=$!
+
+# --- supervise -------------------------------------------------------------
+log "session up; noVNC on :${NOVNC_PORT}, CDP on :${CDP_PORT}"
+
+rc=0
+wait -n || rc=$?
+log "a session component exited (status ${rc})"
+teardown "${rc}"
