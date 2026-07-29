@@ -206,13 +206,17 @@ RUN printf '%s\n' \
 # Selenium-backed WebCursor at package import time, so installing the complete
 # pinned distribution is intentional even though Sagasu's default interaction
 # path only uses SystemCursor.
+ARG WEBSOCKET_CLIENT_VERSION=1.9.0
 RUN python3 -m venv --system-site-packages /opt/sagasu-humancursor \
  && /opt/sagasu-humancursor/bin/python -m pip install \
       --disable-pip-version-check \
       --no-cache-dir \
       "HumanCursor==${HUMANCURSOR_VERSION}" \
+      "websocket-client==${WEBSOCKET_CLIENT_VERSION}" \
  && test "$(/opt/sagasu-humancursor/bin/python -c \
-      'from importlib.metadata import version; print(version("HumanCursor"))')" = "${HUMANCURSOR_VERSION}"
+      'from importlib.metadata import version; print(version("HumanCursor"))')" = "${HUMANCURSOR_VERSION}" \
+ && test "$(/opt/sagasu-humancursor/bin/python -c \
+      'from importlib.metadata import version; print(version("websocket-client"))')" = "${WEBSOCKET_CLIENT_VERSION}"
 
 # --- noVNC static files ----------------------------------------------------
 COPY --from=fetcher /opt/novnc /usr/share/novnc
@@ -251,11 +255,12 @@ RUN if [ "${BROWSER}" != "helium" ]; then \
     if [ -e /opt/helium/chrome-sandbox ]; then chmod 4755 /opt/helium/chrome-sandbox; fi; \
     /usr/bin/helium --version
 
-# --- X-control executor ----------------------------------------------------
+# --- session-control executor ----------------------------------------------
 # The host CLI and private executor intentionally ship as one distribution.
 # Install it into HumanCursor's venv so the executor imports the exact pinned
-# HumanCursor/PyAutoGUI stack above, then expose only the private entry point on
-# the container's ordinary PATH for non-interactive `docker exec`.
+# HumanCursor/PyAutoGUI stack above, then expose the private entry point on the
+# container's ordinary PATH for non-interactive `docker exec`. Keep the former
+# xcontrol name as a compatibility alias while callers migrate.
 COPY pyproject.toml README.md /opt/sagasu-package/
 COPY src /opt/sagasu-package/src
 RUN /opt/sagasu-humancursor/bin/python -m pip install \
@@ -264,8 +269,11 @@ RUN /opt/sagasu-humancursor/bin/python -m pip install \
       --no-build-isolation \
       --no-deps \
       /opt/sagasu-package \
+ && ln -sf /opt/sagasu-humancursor/bin/sagasu-session-exec \
+      /usr/local/bin/sagasu-session-exec \
  && ln -sf /opt/sagasu-humancursor/bin/sagasu-xcontrol \
       /usr/local/bin/sagasu-xcontrol \
+ && test -x /usr/local/bin/sagasu-session-exec \
  && test -x /usr/local/bin/sagasu-xcontrol
 
 # --- session scripts -------------------------------------------------------

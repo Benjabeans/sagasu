@@ -115,7 +115,7 @@ The skill md teaches an agent *when* to reach for these commands and the safety 
 
 One learned rule rides along: text entry into CJK pages goes through CDP `Input.insertText` after an X-level click establishes focus — X keyboard input is keymap-bound and unreliable for 中文.
 
-### Current X-control commands
+### Current session-control commands
 
 The implemented X-control slice uses a UUID4 session label
 (`computer.sagasu.session.id=<uuid>`) to find exactly one running container:
@@ -123,6 +123,7 @@ The implemented X-control slice uses a UUID4 session label
 ```text
 sagasu session display SESSION
 sagasu session screenshot SESSION --out PATH [--no-pointer] [--overwrite]
+sagasu session dom SESSION --out PATH [--overwrite]
 sagasu session cursor SESSION position
 sagasu session cursor SESSION move X Y [--duration-ms N] [--steady]
 sagasu session cursor SESSION click X Y [--button BUTTON] [--count N] [--hold-ms N]
@@ -146,31 +147,45 @@ atomically published at `--out`. A per-container nonblocking lock prevents two
 agents from driving the same cursor; observation takes a shared lock, while
 movement takes an exclusive lock.
 
+`session dom` uses the selected container's loopback-only CDP endpoint to
+serialize the live DOM of the currently visible browser tab as UTF-8 HTML. It
+detects the visible target rather than assuming the first tab, takes the same
+shared observation lock as screenshots, and validates and atomically publishes
+the document at `--out`. The returned JSON includes the page target ID, title,
+URL, byte count, display dimensions, and pointer position. This is the current
+top-level document markup: linked stylesheets remain links, computed styles are
+not inlined, and cross-origin iframe documents are not flattened into it.
+
+The host invokes the private `sagasu-session-exec` entry point inside the
+resolved container. `sagasu-xcontrol` remains available as a compatibility
+alias, but new integrations should use `sagasu`; the private executable is an
+implementation detail.
+
 The design rule that keeps the CLI honest: **it only automates what has exactly one correct way to be done** — container lifecycle, port/volume wiring, screenshots, X input delivery, CDP utility verbs, and queue registration. It is an on-ramp, not a gatekeeper: everything requiring judgment (what to click, when to hand off, which page state matters) stays with the agent, while the skill keeps the transport choice consistent — X input by default, CDP when the operation is inherently structured.
 
 ## Repository layout
 
-The repo contains everything needed to go from `git clone` to a working deployment:
+The implemented Python distribution is organized by responsibility:
 
 ```
 sagasu/
-├── Dockerfile            # the system environment: TigerVNC (Xvnc), openbox, browser
-│                         # (Helium by default, GPG-verified), websockify + vendored noVNC
-├── docker/               # session-container internals: entrypoint + supervisor scripts,
-│                         # healthcheck, sandbox seccomp profile, Helium signing key
-├── docker-compose.yml    # one-command wiring: container, profile volumes, ports,
-│                         # network boundary binding
-├── panel/                # control panel: FIFO intervention queue, type filters,
-│                         # embedded noVNC dashboard
-├── cli/                  # the sagasu CLI — session lifecycle, screenshots,
-│                         # X input, supplemental CDP verbs, handoff plumbing
-├── skill.md              # instructions to the LLM: when to use sagasu, the
-│                         # X-input-first workflow, CDP boundaries, safety rules
-└── docs/                 # worked agent examples: captcha-handoff walkthrough,
-                          # login-once/reuse-profile flow, troubleshooting
+├── pyproject.toml
+├── src/sagasu/
+│   ├── protocol.py       # stable JSON success/error protocol
+│   ├── cli/              # public CLI and private container executor
+│   ├── sessions/         # resolution, Docker transport, locks, handoff state
+│   ├── artifacts/        # atomic publication and PNG/HTML validation
+│   ├── cdp/              # CDP transport and live-DOM capture
+│   └── xcontrol/         # X display capture and cursor control only
+│       └── cursor/       # separate move, click, drag, and scroll operations
+├── tests/                # unit, architecture-boundary, and opt-in live checks
+├── Dockerfile            # Xvnc, browser, noVNC, and installed executor
+└── docker/               # entrypoint, supervisor, healthcheck, and seccomp
 ```
 
-Three of these are the load-bearing pieces: the **Dockerfile** defines the reproducible environment, the **panel** is the human's side of the system, and **skill.md** is the agent's side. The compose file, CLI, and docs exist to make those three usable without ceremony.
+The dependency direction is enforced by tests: `xcontrol` cannot import CDP,
+session, artifact, or CLI modules; the CLI is the composition layer that joins
+those domains.
 
 ## Network model: LAN by default, pluggable by design
 
@@ -190,4 +205,7 @@ The boundary remains a deployment choice, not an assumption baked into the code 
 
 The session container is built: Dockerfile + compose file with Helium (GPG-verified download), TigerVNC, X-level input and display-capture tools (`xdotool` + `scrot`), vendored noVNC, a sandbox-on seccomp profile, and loopback-only internals — verified end-to-end (healthy under compose, CDP reachable from the host only on loopback, clean browser-first shutdown, CJK rendering).
 
-Remaining build order: `setup`/`config` flow → session lifecycle CLI with named profiles and the X-level screenshot/input plumbing → intervention queue + panel → embedded noVNC and agent-resume signaling → skill.md + docs written against the working system.
+The current slice includes resolved-session display, screenshot, DOM, and
+mouse control. Remaining work includes `setup`/`config`, lifecycle management
+with named profiles, keyboard/CDP utility verbs, the intervention queue and
+panel, embedded noVNC resume signaling, and the finished agent skill/docs.
