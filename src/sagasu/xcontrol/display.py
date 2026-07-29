@@ -6,7 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Callable
 
-from sagasu.xcontrol.protocol import SagasuError
+from sagasu.protocol import SagasuError
 
 
 Runner = Callable[..., subprocess.CompletedProcess[bytes]]
@@ -121,4 +121,3 @@ def validate_coordinate(
             },
             exit_status=2,
         )
-

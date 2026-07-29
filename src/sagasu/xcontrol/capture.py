@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 from typing import BinaryIO, Callable
 
-from sagasu.xcontrol.protocol import SagasuError
+from sagasu.protocol import SagasuError
 
 
 def stream_png(
