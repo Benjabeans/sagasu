@@ -77,6 +77,12 @@ def build_parser() -> argparse.ArgumentParser:
     dom.add_argument("--out", required=True)
     dom.add_argument("--overwrite", action="store_true")
 
+    locate = session_commands.add_parser(
+        "locate", help="locate a visible element in full-display coordinates"
+    )
+    _add_target(locate)
+    locate.add_argument("selector")
+
     navigate = session_commands.add_parser(
         "navigate", help="navigate the active page through CDP"
     )

@@ -9,6 +9,7 @@ from typing import BinaryIO, Sequence, TextIO
 
 from sagasu.cdp.dom import stream_active_dom
 from sagasu.cdp.insert_text import insert_text_active_page
+from sagasu.cdp.locate import ElementLocation, locate_active_element
 from sagasu.cdp.navigate import navigate_active_page
 from sagasu.protocol import SagasuError, success, write_json
 from sagasu.sessions import human_control
@@ -51,6 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "dom", help="write the active page's live HTML DOM to stdout"
     )
+
+    locate = commands.add_parser(
+        "locate", help="locate a visible element in X-display coordinates"
+    )
+    locate.add_argument("selector")
 
     navigate = commands.add_parser(
         "navigate", help="navigate the active page through CDP"
@@ -234,6 +240,27 @@ def execute(
         write_json(_result("display", "xdotool", display, pointer), text_stdout)
         return
 
+    if arguments.command == "locate":
+        with session_lock(exclusive=False, path=lock_path):
+            display = get_display_size()
+            location = locate_active_element(
+                arguments.selector,
+                display_width=display.width,
+                display_height=display.height,
+            )
+            pointer = get_pointer_position()
+        write_json(
+            _result(
+                "element.locate",
+                "cdp",
+                display,
+                pointer,
+                **_location_metadata(location),
+            ),
+            text_stdout,
+        )
+        return
+
     if arguments.command in ("navigate", "insert-text"):
         payload = _execute_cdp_mutation(
             arguments,
@@ -306,6 +333,49 @@ def _execute_cdp_mutation(
         display = get_display_size()
         pointer = get_pointer_position()
     return _result(operation, "cdp", display, pointer, **extra)
+
+
+def _location_metadata(location: ElementLocation) -> dict[str, object]:
+    return {
+        "target_id": location.target_id,
+        "title": location.title,
+        "url": location.url,
+        "selector": location.selector,
+        "node_id": location.node_id,
+        "screen": {
+            "x": location.screen_x,
+            "y": location.screen_y,
+        },
+        "viewport": {
+            "point": {
+                "x": location.viewport_x,
+                "y": location.viewport_y,
+            },
+            "width": location.viewport_width,
+            "height": location.viewport_height,
+            "quad": list(location.viewport_quad),
+            "visible_polygon": [
+                {"x": point[0], "y": point[1]}
+                for point in location.visible_polygon
+            ],
+        },
+        "mapping": {
+            "viewport_origin": {
+                "x": location.viewport_origin_x,
+                "y": location.viewport_origin_y,
+            },
+            "scale": {
+                "x": location.scale_x,
+                "y": location.scale_y,
+            },
+            "browser_window": {
+                "left": location.window_left,
+                "top": location.window_top,
+                "width": location.window_width,
+                "height": location.window_height,
+            },
+        },
+    }
 
 
 def _execute_mutation(

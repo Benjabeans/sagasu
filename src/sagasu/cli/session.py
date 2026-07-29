@@ -6,6 +6,7 @@ import argparse
 from typing import Any
 
 from sagasu.cdp.insert_text import validate_insert_text
+from sagasu.cdp.locate import validate_selector
 from sagasu.cdp.navigate import validate_navigation_url
 from sagasu.protocol import SagasuError
 from sagasu.sessions.artifacts import save_dom, save_screenshot
@@ -46,6 +47,9 @@ def _runtime_arguments(arguments: argparse.Namespace) -> list[str]:
     command = arguments.session_command
     if command == "display":
         return ["display"]
+    if command == "locate":
+        validate_selector(arguments.selector)
+        return ["locate", arguments.selector]
     if command == "navigate":
         validate_navigation_url(arguments.url)
         return ["navigate", arguments.url]
