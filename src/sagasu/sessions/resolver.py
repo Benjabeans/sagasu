@@ -2,24 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Mapping
 from uuid import UUID
 
-from sagasu.sessions.docker_cli import (
+from sagasu.protocol import SagasuError
+from sagasu.sessions.docker import DockerCLI
+from sagasu.sessions.models import (
     SESSION_LABEL,
     ContainerSummary,
-    DockerCLI,
-    _parse_labels,
+    ResolvedSession,
+    parse_labels,
 )
-from sagasu.xcontrol.protocol import SagasuError
-
-
-@dataclass(frozen=True)
-class ResolvedSession:
-    session_id: str | None
-    container_id: str
-    container_name: str
 
 
 def normalize_session_id(value: str) -> str:
@@ -110,7 +103,7 @@ def _resolve_container(docker: DockerCLI, container: str) -> ResolvedSession:
     config = inspected.get("Config")
     labels: dict[str, str] = {}
     if isinstance(config, Mapping):
-        labels = _parse_labels(config.get("Labels"))
+        labels = parse_labels(config.get("Labels"))
     if not any(key.startswith("computer.sagasu.") for key in labels):
         raise SagasuError(
             "not_sagasu_container",
