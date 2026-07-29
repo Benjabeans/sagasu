@@ -99,6 +99,7 @@ sagasu session start [--profile <name>] [--url <start-url>]   # launch a session
 sagasu session screenshot <session-id> [--out <path>]          # capture the full display, browser chrome included
 sagasu session cursor <session-id> move|click|drag ...          # primary: drive the real X cursor
 sagasu session key <session-id> press|type ...                  # primary: send input to the X-focused window
+sagasu session locate <session-id> <css-selector>               # supplemental: DOM target to X-screen coordinates
 sagasu session navigate <session-id> <url>                      # supplemental: direct CDP navigation
 sagasu session insert-text <session-id> <text>                  # supplemental: CDP Unicode text insertion
 sagasu handoff request <session-id> --type captcha|login|other --note "..."   # enqueue for the human, block or poll
@@ -124,6 +125,7 @@ The implemented X-control slice uses a UUID4 session label
 sagasu session display SESSION
 sagasu session screenshot SESSION --out PATH [--no-pointer] [--overwrite]
 sagasu session dom SESSION --out PATH [--overwrite]
+sagasu session locate SESSION CSS_SELECTOR
 sagasu session navigate SESSION URL
 sagasu session insert-text SESSION TEXT
 sagasu session cursor SESSION position
@@ -157,6 +159,15 @@ the document at `--out`. The returned JSON includes the page target ID, title,
 URL, byte count, display dimensions, and pointer position. This is the current
 top-level document markup: linked stylesheets remain links, computed styles are
 not inlined, and cross-origin iframe documents are not flattened into it.
+
+`session locate` resolves a CSS selector in that active top-level document,
+clips its CDP content quads to the visible page viewport, and returns a safe
+point as `screen.x` and `screen.y` in the full-display screenshot coordinate
+space. It derives the browser-chrome offset from live window, viewport, zoom,
+and X-display metrics rather than using a fixed toolbar height. It is a
+read-only grounding operation: it neither scrolls nor clicks. An offscreen or
+missing element fails explicitly, and the agent must still compare the result
+with a fresh screenshot before passing it to the X cursor.
 
 `session navigate` sends an absolute HTTP(S) URL to the active page with
 `Page.navigate`. It reports when Chromium accepts or rejects the navigation;
