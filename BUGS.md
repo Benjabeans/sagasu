@@ -24,7 +24,7 @@ The internal placeholder `__sagasu_explicit_container__` inserted for the `--con
 
 **Fix:** Post-parse validation now permits the sentinel only in `session_target` and raises a structured usage error if argparse assigns it to an action operand. Covered for locate, navigate, and insert-text by `test_explicit_container_does_not_fill_missing_action_operand`.
 
-## 3. Missing `--` separator when forwarding text to the in-container executor — CONFIRMED
+## 3. Missing `--` separator when forwarding text to the in-container executor — FIXED
 
 **Where:** `src/sagasu/cli/session.py:58` (same pattern for `locate` at line 52)
 
@@ -32,13 +32,17 @@ User text is forwarded to the in-container executor argv without a `--` separato
 
 **Failure scenario:** A user runs `sagasu session insert-text SESSION -- "-hello"` (the host parser accepts it via `--`). The host builds `["insert-text", "-hello"]` and docker-execs `sagasu-session-exec insert-text -hello`; the executor's argparse treats `-hello` as an option cluster starting with `-h`, prints its help text to stdout and exits 0 (verified: SystemExit 0). The host then fails with `invalid_response: sagasu-session-exec returned invalid JSON` — or, for other dash text, `invalid_arguments` — so valid text starting with `-` can never be inserted.
 
-## 4. Executor's argparse `-h/--help` action corrupts the JSON stdout protocol — CONFIRMED
+**Fix:** Host-side forwarding now inserts an option terminator before each opaque CDP action operand, so dash-prefixed selectors, URLs, and text remain positional values in the executor. Covered by `test_bug_3_dash_prefixed_text_is_separated_from_executor_options` and `test_runtime_arguments_expose_supplemental_cdp_actions`.
 
-**Where:** `src/sagasu/cli/session_executor.py:38`
+## 4. Executor's argparse `-h/--help` action corrupts the JSON stdout protocol — FIXED
+
+**Where:** `src/sagasu/cli/session_executor.py` (`ProtocolArgumentParser`)
 
 The private `ProtocolArgumentParser` keeps argparse's default `-h/--help` action enabled, which prints human-readable help to stdout and raises `SystemExit(0)` — bypassing the overridden `error()` and the JSON-only stdout protocol that `DockerCLI.exec_json` relies on.
 
 **Failure scenario:** Verified: `sagasu-session-exec insert-text -hello` (or any stray argument argparse can prefix-match to `-h`) exits 0 with plain help text on stdout. On the host, `exec_json` sees returncode 0, tries `parse_json_object` on the help text, and raises `invalid_response: sagasu-session-exec returned invalid JSON` — the agent gets a misleading transport-corruption error (and a zero exit from the container) instead of a structured `invalid_arguments` error for a bad-input condition.
+
+**Fix:** The private executor disables argparse's default help action for the root parser and every nested subparser. Invalid or help-like input now reaches the protocol-aware error handler, which emits one JSON error on stderr and returns status 2. Covered by `test_bug_4_executor_parse_failures_remain_json_only`.
 
 ## 5. `validate_html` rejects legitimate non-HTML documents (SVG/XML) — CONFIRMED
 

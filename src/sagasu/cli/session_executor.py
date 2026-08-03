@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import BinaryIO, Sequence, TextIO
+from typing import Any, BinaryIO, NoReturn, Sequence, TextIO, cast
 
 from sagasu.cdp.dom import stream_active_dom
 from sagasu.cdp.insert_text import insert_text_active_page
@@ -26,7 +26,14 @@ from sagasu.xcontrol.display import (
 
 
 class ProtocolArgumentParser(argparse.ArgumentParser):
-    def error(self, message: str) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # This is a private machine-to-machine interface. Default argparse
+        # help writes human-readable text to stdout and exits before main can
+        # serialize the failure, so keep every parser in the tree JSON-only.
+        kwargs["add_help"] = False
+        super().__init__(*args, **kwargs)
+
+    def error(self, message: str) -> NoReturn:
         raise SagasuError(
             "invalid_arguments",
             message,
@@ -197,13 +204,15 @@ def execute(
     lock_path: Path | str = LOCK_PATH,
     pause_path: Path | str = human_control.PAUSE_PATH,
 ) -> None:
+    # typeshed types sys.stdout/stderr as "TextIO | Any" because they can be
+    # detached; cast so the None-default parameters narrow properly.
     if text_stdout is None:
-        text_stdout = sys.stdout
+        text_stdout = cast(TextIO, sys.stdout)
     if metadata_stream is None:
-        metadata_stream = sys.stderr
+        metadata_stream = cast(TextIO, sys.stderr)
     if arguments.command == "screenshot":
         if binary_stdout is None:
-            binary_stdout = sys.stdout.buffer
+            binary_stdout = cast(BinaryIO, sys.stdout.buffer)
         with session_lock(exclusive=False, path=lock_path):
             stream_png(
                 binary_stdout,
@@ -213,7 +222,7 @@ def execute(
 
     if arguments.command == "dom":
         if binary_stdout is None:
-            binary_stdout = sys.stdout.buffer
+            binary_stdout = cast(BinaryIO, sys.stdout.buffer)
         with session_lock(exclusive=False, path=lock_path):
             snapshot = stream_active_dom(binary_stdout)
             display = get_display_size()
@@ -388,6 +397,8 @@ def _execute_mutation(
     duration: float | None = None
     if hasattr(arguments, "duration_ms"):
         duration = _duration_seconds(arguments.duration_ms)
+    count = 1
+    hold = 0.0
     if command == "click":
         count = _positive_count(arguments.count)
         hold = _hold_seconds(arguments.hold_ms)

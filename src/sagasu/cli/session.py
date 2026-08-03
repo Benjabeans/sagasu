@@ -49,13 +49,13 @@ def _runtime_arguments(arguments: argparse.Namespace) -> list[str]:
         return ["display"]
     if command == "locate":
         validate_selector(arguments.selector)
-        return ["locate", arguments.selector]
+        return ["locate", "--", arguments.selector]
     if command == "navigate":
         validate_navigation_url(arguments.url)
-        return ["navigate", arguments.url]
+        return ["navigate", "--", arguments.url]
     if command == "insert-text":
         validate_insert_text(arguments.text)
-        return ["insert-text", arguments.text]
+        return ["insert-text", "--", arguments.text]
     if command != "cursor":  # pragma: no cover - parser constrains this
         raise SagasuError(
             "invalid_arguments",

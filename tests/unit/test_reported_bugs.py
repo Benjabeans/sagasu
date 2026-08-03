@@ -81,10 +81,6 @@ def test_bug_2_explicit_container_does_not_fill_a_missing_action_operand():
     assert error.value.exit_status == 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUGS.md #3: dash-prefixed input is forwarded without --",
-)
 def test_bug_3_dash_prefixed_text_is_separated_from_executor_options():
     arguments = build_parser().parse_args(
         [
@@ -96,17 +92,17 @@ def test_bug_3_dash_prefixed_text_is_separated_from_executor_options():
         ]
     )
 
-    assert _runtime_arguments(arguments) == [
+    runtime_arguments = _runtime_arguments(arguments)
+    assert runtime_arguments == [
         "insert-text",
         "--",
         "-hello",
     ]
+    assert session_executor.build_parser().parse_args(
+        runtime_arguments
+    ).text == "-hello"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUGS.md #4: executor help bypasses the JSON protocol",
-)
 def test_bug_4_executor_parse_failures_remain_json_only(capsys):
     try:
         status = session_executor.main(["insert-text", "-hello"])

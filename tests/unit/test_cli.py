@@ -174,6 +174,7 @@ def test_runtime_arguments_expose_supplemental_cdp_actions():
     )
     assert _runtime_arguments(locate) == [
         "locate",
+        "--",
         "button.buy",
     ]
 
@@ -187,6 +188,7 @@ def test_runtime_arguments_expose_supplemental_cdp_actions():
     )
     assert _runtime_arguments(navigate) == [
         "navigate",
+        "--",
         "https://example.test/results?q=iem",
     ]
 
@@ -195,6 +197,7 @@ def test_runtime_arguments_expose_supplemental_cdp_actions():
     )
     assert _runtime_arguments(insert_text) == [
         "insert-text",
+        "--",
         "有線 IEM",
     ]
 
