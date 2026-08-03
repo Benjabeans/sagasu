@@ -121,6 +121,22 @@ def test_container_replaces_session_but_cannot_accompany_it():
     assert insert_text.text == "有線 IEM"
 
 
+@pytest.mark.parametrize("command", ("locate", "navigate", "insert-text"))
+def test_explicit_container_does_not_fill_missing_action_operand(command):
+    with pytest.raises(SagasuError) as error:
+        build_parser().parse_args(
+            [
+                "session",
+                command,
+                "--container",
+                "sagasu-preview",
+            ]
+        )
+
+    assert error.value.code == "invalid_arguments"
+    assert error.value.exit_status == 2
+
+
 def test_runtime_arguments_keep_coordinate_action_atomic():
     parsed = build_parser().parse_args(
         [

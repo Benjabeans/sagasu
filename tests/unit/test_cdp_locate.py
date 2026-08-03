@@ -87,7 +87,12 @@ def responses(*, node_id=73, quads=None):
         "Runtime.evaluate": {
             "result": {
                 "type": "object",
-                "value": {"width": 1366, "height": 768},
+                "value": {
+                    "screenWidth": 1366,
+                    "screenHeight": 768,
+                    "innerHeight": 695,
+                    "outerHeight": 767,
+                },
             }
         },
     }
@@ -121,8 +126,10 @@ def test_locates_element_in_absolute_x_display_coordinates():
             "Runtime.evaluate",
             {
                 "expression": (
-                    "({width:window.screen.width,"
-                    "height:window.screen.height})"
+                    "({screenWidth:window.screen.width,"
+                    "screenHeight:window.screen.height,"
+                    "innerHeight:window.innerHeight,"
+                    "outerHeight:window.outerHeight})"
                 ),
                 "returnByValue": True,
             },
@@ -135,6 +142,23 @@ def test_locates_element_in_absolute_x_display_coordinates():
     assert result.viewport_origin_y == 72
     assert result.selector == "textarea[name=q]"
     assert result.target_id == "target-1"
+
+
+def test_horizontal_scrollbar_does_not_shift_screen_coordinates():
+    scrollbar = responses()
+    scrollbar["Page.getLayoutMetrics"]["cssVisualViewport"][
+        "clientHeight"
+    ] = 680
+
+    result = locate.locate_active_element(
+        "textarea[name=q]",
+        display_width=1366,
+        display_height=768,
+        client=FakeClient(scrollbar),
+    )
+
+    assert result.viewport_origin_y == 72
+    assert (result.screen_x, result.screen_y) == (603, 319)
 
 
 def test_uses_center_of_the_visible_part_of_a_clipped_quad():

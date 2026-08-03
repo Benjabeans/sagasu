@@ -32,18 +32,30 @@ class ProtocolArgumentParser(argparse.ArgumentParser):
         # by a subparser when that subparser itself accepts positionals. Supply
         # an internal placeholder for the documented `--container replaces
         # SESSION` spelling, then erase it from the parsed namespace.
-        if (
+        explicit_container_target = (
             len(raw) >= 4
             and raw[0] == "session"
             and raw[2] == "--container"
-        ):
+        )
+        if explicit_container_target:
             raw.insert(4, self._CONTAINER_TARGET)
         parsed = super().parse_args(raw, namespace)
         if (
-            getattr(parsed, "session_target", None)
+            explicit_container_target
+            and getattr(parsed, "session_target", None)
             == self._CONTAINER_TARGET
         ):
             parsed.session_target = None
+        elif explicit_container_target:
+            for attribute in ("selector", "url", "text"):
+                if (
+                    getattr(parsed, attribute, None)
+                    == self._CONTAINER_TARGET
+                ):
+                    self.error(
+                        f"the following arguments are required: {attribute}"
+                    )
+            self.error("the explicit container target could not be parsed")
         return parsed
 
 

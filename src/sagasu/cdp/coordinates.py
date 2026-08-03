@@ -29,10 +29,12 @@ class ViewportMetrics:
 
 @dataclass(frozen=True)
 class CSSScreenSize:
-    """Screen dimensions exposed to the page by the CSSOM View API."""
+    """Screen and browser dimensions exposed by the CSSOM View API."""
 
     width: float
     height: float
+    inner_height: float
+    outer_height: float
 
 
 @dataclass(frozen=True)
@@ -61,9 +63,10 @@ def convert_viewport_to_screen(
 
     Chromium reports element quads in viewport CSS pixels, browser bounds in
     screen coordinates, and page zoom as the CSS-to-window scale. Sagasu's X
-    screenshot uses root-display pixels. The controlled session layout anchors
-    the page viewport to the lower-left corner of its browser window, leaving
-    the tab and address bars above it.
+    screenshot uses root-display pixels. CSSOM ``innerHeight`` includes a
+    horizontal scrollbar, unlike CDP's viewport ``clientHeight``. Using the
+    inner browser height therefore keeps the viewport's top edge stable when
+    bottom scrollbar space appears.
     """
 
     _require_display_size(display_width, display_height)
@@ -78,6 +81,8 @@ def convert_viewport_to_screen(
     _require_positive("viewport.zoom", viewport.zoom)
     _require_positive("css_screen.width", css_screen.width)
     _require_positive("css_screen.height", css_screen.height)
+    _require_positive("css_screen.inner_height", css_screen.inner_height)
+    _require_positive("css_screen.outer_height", css_screen.outer_height)
 
     if not 0 <= viewport_x < viewport.width or not 0 <= viewport_y < viewport.height:
         raise SagasuError(
@@ -92,8 +97,28 @@ def convert_viewport_to_screen(
             },
         )
 
+    if viewport.height > css_screen.inner_height + 1:
+        raise SagasuError(
+            "coordinate_mapping_failed",
+            "The CDP viewport is taller than the browser's inner viewport",
+            {
+                "viewport_height": viewport.height,
+                "browser_inner_height": css_screen.inner_height,
+            },
+        )
+
     viewport_window_width = viewport.width * viewport.zoom
     viewport_window_height = viewport.height * viewport.zoom
+    inner_window_height = css_screen.inner_height * viewport.zoom
+    if inner_window_height > css_screen.outer_height + 1:
+        raise SagasuError(
+            "coordinate_mapping_failed",
+            "The browser's inner viewport is taller than its outer window",
+            {
+                "browser_inner_height": inner_window_height,
+                "browser_outer_height": css_screen.outer_height,
+            },
+        )
     if (
         viewport_window_width > window.width + 1
         or viewport_window_height > window.height + 1
@@ -119,8 +144,10 @@ def convert_viewport_to_screen(
     point_scale_y = viewport.zoom * screen_scale_y
 
     origin_x = window.left * screen_scale_x
+    top_chrome_height = css_screen.outer_height - inner_window_height
+    window_height_scale = window.height / css_screen.outer_height
     origin_y = (
-        window.top + window.height - viewport_window_height
+        window.top + top_chrome_height * window_height_scale
     ) * screen_scale_y
     screen_x_float = origin_x + viewport_x * point_scale_x
     screen_y_float = origin_y + viewport_y * point_scale_y

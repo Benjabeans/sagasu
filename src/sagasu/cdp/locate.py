@@ -26,7 +26,10 @@ from sagasu.protocol import SagasuError
 
 MAX_SELECTOR_BYTES = 16 * 1024
 _SCREEN_METRICS_EXPRESSION = (
-    "({width:window.screen.width,height:window.screen.height})"
+    "({screenWidth:window.screen.width,"
+    "screenHeight:window.screen.height,"
+    "innerHeight:window.innerHeight,"
+    "outerHeight:window.outerHeight})"
 )
 _Point = tuple[float, float]
 
@@ -250,8 +253,18 @@ def _css_screen_size(response: Mapping[str, object]) -> CSSScreenSize:
             "CDP omitted the page's CSS screen dimensions",
         )
     return CSSScreenSize(
-        width=_positive_number(value, "width", "CSS screen width"),
-        height=_positive_number(value, "height", "CSS screen height"),
+        width=_positive_number(value, "screenWidth", "CSS screen width"),
+        height=_positive_number(value, "screenHeight", "CSS screen height"),
+        inner_height=_positive_number(
+            value,
+            "innerHeight",
+            "browser inner height",
+        ),
+        outer_height=_positive_number(
+            value,
+            "outerHeight",
+            "browser outer height",
+        ),
     )
 
 

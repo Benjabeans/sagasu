@@ -1,24 +1,28 @@
 # BUGS
 
-Findings from a full-codebase review (2026-07-31). 27 verified candidate issues were consolidated into the 10 distinct defects below, ranked most severe first. Verdicts: **CONFIRMED** = reproduced or proven from code; **PLAUSIBLE** = mechanism verified in code, trigger depends on environment.
+Findings from a full-codebase review (2026-07-31). 27 verified candidate issues were consolidated into the 10 distinct defects below, ranked most severe first. Verdicts: **FIXED** = corrected with a passing regression test; **CONFIRMED** = reproduced or proven from code; **PLAUSIBLE** = mechanism verified in code, trigger depends on environment.
 
 ---
 
-## 1. Click coordinates shift down when bottom browser chrome is present — CONFIRMED
+## 1. Click coordinates shift down when bottom browser chrome is present — FIXED
 
-**Where:** `src/sagasu/cdp/coordinates.py:122`
+**Where:** `src/sagasu/cdp/coordinates.py` (`convert_viewport_to_screen`)
 
 The viewport origin is anchored to the very bottom of the browser window, ignoring bottom browser chrome such as a horizontal scrollbar, so the computed Y origin is too low whenever anything sits below the page viewport.
 
 **Failure scenario:** A page is wide enough to show a horizontal scrollbar (~15 px tall at the bottom of the content area). `cssVisualViewport.clientHeight` excludes the scrollbar, so `origin_y = (window.top + window.height - viewport_height*zoom)` places the viewport top ~15 px lower than reality. Every `sagasu session locate` result is shifted ~15 px down, and the follow-up `cursor click` at the returned screen coordinates lands below the element — hitting the scrollbar or the wrong element (same for a download shelf or any bottom chrome).
 
-## 2. `__sagasu_explicit_container__` sentinel leaks into positional arguments — CONFIRMED
+**Fix:** Coordinate conversion now uses CSSOM inner-window geometry, whose height includes scrollbar space, to calculate a stable page origin. Covered by `test_bug_1_bottom_chrome_does_not_shift_viewport_origin` and `test_horizontal_scrollbar_does_not_shift_screen_coordinates`.
 
-**Where:** `src/sagasu/cli/main.py:40` (also line 38, same root cause)
+## 2. `__sagasu_explicit_container__` sentinel leaks into positional arguments — FIXED
+
+**Where:** `src/sagasu/cli/main.py` (`ProtocolArgumentParser.parse_args`)
 
 The internal placeholder `__sagasu_explicit_container__` inserted for the `--container` spelling is only erased when it lands in `session_target`; when the subcommand's own positional is omitted, argparse assigns the placeholder to that positional and it is used as a real value.
 
 **Failure scenario:** A user runs `sagasu session insert-text --container sagasu-preview` and forgets TEXT. `parse_args` inserts the placeholder at index 4; argparse gives `session_target=None` and `text='__sagasu_explicit_container__'` (verified by running `build_parser().parse_args`). Instead of a usage error, Sagasu docker-execs insert-text and types the literal string `__sagasu_explicit_container__` into whatever page element is focused — corrupting a live web form. The navigate/locate variants similarly turn a missing-argument mistake into a confusing invalid-URL / element-not-found error.
+
+**Fix:** Post-parse validation now permits the sentinel only in `session_target` and raises a structured usage error if argparse assigns it to an action operand. Covered for locate, navigate, and insert-text by `test_explicit_container_does_not_fill_missing_action_operand`.
 
 ## 3. Missing `--` separator when forwarding text to the in-container executor — CONFIRMED
 

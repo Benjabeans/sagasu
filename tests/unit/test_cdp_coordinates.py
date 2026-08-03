@@ -26,7 +26,12 @@ def test_converts_live_container_viewport_point_to_x_display():
             height=695,
             zoom=1,
         ),
-        css_screen=CSSScreenSize(width=1366, height=768),
+        css_screen=CSSScreenSize(
+            width=1366,
+            height=768,
+            inner_height=695,
+            outer_height=767,
+        ),
         display_width=1366,
         display_height=768,
     )
@@ -53,7 +58,12 @@ def test_accounts_for_page_zoom_and_x_display_scaling():
             height=200,
             zoom=2,
         ),
-        css_screen=CSSScreenSize(width=1000, height=600),
+        css_screen=CSSScreenSize(
+            width=1000,
+            height=600,
+            inner_height=200,
+            outer_height=500,
+        ),
         display_width=2000,
         display_height=1200,
     )
@@ -67,7 +77,12 @@ def test_accounts_for_page_zoom_and_x_display_scaling():
 
 def test_rejects_points_or_metrics_that_cannot_map_to_the_display():
     window = BrowserWindowBounds(left=0, top=0, width=100, height=100)
-    screen = CSSScreenSize(width=100, height=100)
+    screen = CSSScreenSize(
+        width=100,
+        height=100,
+        inner_height=50,
+        outer_height=100,
+    )
 
     with pytest.raises(SagasuError) as outside:
         convert_viewport_to_screen(
