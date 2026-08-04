@@ -151,6 +151,39 @@ atomically published at `--out`. A per-container nonblocking lock prevents two
 agents from driving the same cursor; observation takes a shared lock, while
 movement takes an exclusive lock.
 
+### Optional idle cursor motion
+
+Each container can run a lightweight idle daemon that plays short, movement-only
+X cursor animations after agent activity stops. It is enabled by default with
+a five-second inactivity delay:
+
+```text
+SAGASU_IDLE_ENABLED=1
+SAGASU_IDLE_AFTER_SECONDS=5
+SAGASU_IDLE_RADIUS_PX=300
+SAGASU_IDLE_MIN_DURATION_SECONDS=0.3
+SAGASU_IDLE_MAX_DURATION_SECONDS=2
+```
+
+Every in-container executor command counts as activity, including screenshots,
+DOM capture, CDP utilities, and cursor observation. Commands take priority over
+idle motion through a separate gate. A command records its intent immediately,
+waits for the current HumanCursor trajectory to finish, and prevents another
+idle movement from starting. Since each trajectory is capped at two seconds,
+this adds at most roughly two seconds of command latency. Human-control pause
+uses the same mechanism, disables idle movement completely, and resume starts
+a fresh cooldown. An unexpected pointer displacement also cancels idle mode as
+a fallback for unannounced external control.
+
+After five idle seconds, the daemon records the current pointer as a fixed
+anchor and continuously chooses random visible destinations within a 300-pixel
+circle around it. Every movement uses HumanCursor with a separately randomized
+duration from 0.3 to 2 seconds. The anchor does not drift as the cursor moves;
+new agent or human activity clears it. Idle motion never clicks, scrolls,
+drags, or types. Because genuine X pointer movement still generates browser
+mousemove and hover events, disable this when those page-visible effects are
+not acceptable.
+
 `session dom` uses the selected container's loopback-only CDP endpoint to
 serialize the live DOM of the currently visible browser tab as UTF-8 HTML. It
 detects the visible target rather than assuming the first tab, takes the same
@@ -194,12 +227,13 @@ sagasu/
 ├── pyproject.toml
 ├── src/sagasu/
 │   ├── protocol.py       # stable JSON success/error protocol
-│   ├── cli/              # public CLI and private container executor
-│   ├── sessions/         # resolution, Docker transport, locks, handoff state
+│   ├── cli/              # public CLI, container executor, and idle daemon
+│   ├── sessions/         # resolution, transport, locks, activity, handoff state
 │   ├── artifacts/        # atomic publication and PNG/HTML validation
 │   ├── cdp/              # CDP transport and live-DOM capture
 │   └── xcontrol/         # X display capture and cursor control only
-│       └── cursor/       # separate move, click, drag, and scroll operations
+│       ├── cursor/       # separate move, click, drag, and scroll operations
+│       └── idle/         # modular, interruptible idle-animation patterns
 ├── tests/                # unit, architecture-boundary, and opt-in live checks
 ├── Dockerfile            # Xvnc, browser, noVNC, and installed executor
 └── docker/               # entrypoint, supervisor, healthcheck, and seccomp

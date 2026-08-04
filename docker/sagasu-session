@@ -2,11 +2,11 @@
 #
 # Sagasu session supervisor — crash-only, no init system.
 #
-# Starts the four support processes and the browser in the background and then
-# blocks on `wait -n`. ANY of them exiting ends the container: the browser
-# closing means the session is over, by design. On SIGTERM the browser is
-# stopped FIRST and waited for, so its cookie/session databases flush before
-# the display disappears (compose grants stop_grace_period for this).
+# Starts the support processes and the browser in the background and then
+# blocks on `wait -n`. Critical support processes ending stop the container;
+# the optional cosmetic idle daemon is noncritical and simply disables itself
+# if it exits. On SIGTERM the browser is stopped FIRST and waited for, so its
+# cookie/session databases flush before the display disappears.
 #
 set -euo pipefail
 
@@ -28,12 +28,14 @@ die() { log "FATAL: $*"; exit 1; }
 : "${SAGASU_NO_SANDBOX:=}"
 : "${X_STARTUP_TIMEOUT:=15}"
 : "${BROWSER_STOP_TIMEOUT:=10}"
+: "${SAGASU_IDLE_ENABLED:=1}"
 
 display_num="${DISPLAY#:}"
 display_num="${display_num%%.*}"
 x_socket="/tmp/.X11-unix/X${display_num}"
 
 browser_pid=""
+idle_pid=""
 aux_pids=()
 shutting_down=0
 
@@ -64,6 +66,10 @@ teardown() {
     if [[ -n "${browser_pid}" ]]; then
         log "stopping the browser (pid ${browser_pid}) and letting it flush"
         stop_pid "${browser_pid}" "${BROWSER_STOP_TIMEOUT}"
+    fi
+
+    if [[ -n "${idle_pid}" ]]; then
+        stop_pid "${idle_pid}" 3
     fi
 
     local pid
@@ -160,10 +166,33 @@ log "starting browser ${BROWSER_BIN} (profile ${PROFILE_DIR}, cdp 127.0.0.1:${CD
 "${BROWSER_BIN}" "${browser_args[@]}" "${extra_args[@]}" "${START_URL}" &
 browser_pid=$!
 
+# --- 6. optional cursor idle daemon ---------------------------------------
+case "${SAGASU_IDLE_ENABLED,,}" in
+    1|true|yes|on)
+        log "starting noncritical cursor idle daemon"
+        sagasu-idle-daemon &
+        idle_pid=$!
+        ;;
+    0|false|no|off|"")
+        log "cursor idle daemon disabled"
+        ;;
+    *)
+        log "WARNING: invalid SAGASU_IDLE_ENABLED=${SAGASU_IDLE_ENABLED}; cursor idle daemon disabled"
+        ;;
+esac
+
 # --- supervise -------------------------------------------------------------
 log "session up; noVNC on :${NOVNC_PORT}, CDP on :${CDP_PORT}"
 
-rc=0
-wait -n || rc=$?
-log "a session component exited (status ${rc})"
-teardown "${rc}"
+while true; do
+    rc=0
+    completed_pid=""
+    wait -n -p completed_pid || rc=$?
+    if [[ -n "${idle_pid}" && "${completed_pid}" == "${idle_pid}" ]]; then
+        log "cursor idle daemon exited (status ${rc}); idle movement disabled"
+        idle_pid=""
+        continue
+    fi
+    log "a critical session component exited (pid ${completed_pid:-unknown}, status ${rc})"
+    teardown "${rc}"
+done

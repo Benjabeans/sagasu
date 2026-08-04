@@ -13,6 +13,7 @@ from sagasu.cdp.locate import ElementLocation, locate_active_element
 from sagasu.cdp.navigate import navigate_active_page
 from sagasu.protocol import SagasuError, success, write_json
 from sagasu.sessions import human_control
+from sagasu.sessions.activity import agent_activity, paths_for_lock
 from sagasu.sessions.locking import LOCK_PATH, session_lock
 from sagasu.xcontrol.capture import stream_png
 from sagasu.xcontrol.cursor import create_backend, normalize_button
@@ -203,6 +204,32 @@ def execute(
     metadata_stream: TextIO | None = None,
     lock_path: Path | str = LOCK_PATH,
     pause_path: Path | str = human_control.PAUSE_PATH,
+    activity_path: Path | str | None = None,
+    idle_gate_path: Path | str | None = None,
+) -> None:
+    default_activity_path, default_idle_gate_path = paths_for_lock(lock_path)
+    with agent_activity(
+        activity_path=activity_path or default_activity_path,
+        gate_path=idle_gate_path or default_idle_gate_path,
+    ):
+        _execute_command(
+            arguments,
+            text_stdout=text_stdout,
+            binary_stdout=binary_stdout,
+            metadata_stream=metadata_stream,
+            lock_path=lock_path,
+            pause_path=pause_path,
+        )
+
+
+def _execute_command(
+    arguments: argparse.Namespace,
+    *,
+    text_stdout: TextIO | None,
+    binary_stdout: BinaryIO | None,
+    metadata_stream: TextIO | None,
+    lock_path: Path | str,
+    pause_path: Path | str,
 ) -> None:
     # typeshed types sys.stdout/stderr as "TextIO | Any" because they can be
     # detached; cast so the None-default parameters narrow properly.

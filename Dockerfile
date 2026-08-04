@@ -271,8 +271,11 @@ RUN /opt/sagasu-humancursor/bin/python -m pip install \
       /opt/sagasu-package \
  && ln -sf /opt/sagasu-humancursor/bin/sagasu-session-exec \
       /usr/local/bin/sagasu-session-exec \
+ && ln -sf /opt/sagasu-humancursor/bin/sagasu-idle-daemon \
+      /usr/local/bin/sagasu-idle-daemon \
  && ln -sf /opt/sagasu-humancursor/bin/sagasu-xcontrol \
       /usr/local/bin/sagasu-xcontrol \
+ && test -x /usr/local/bin/sagasu-idle-daemon \
  && test -x /usr/local/bin/sagasu-session-exec \
  && test -x /usr/local/bin/sagasu-xcontrol
 
@@ -308,6 +311,11 @@ ENV DISPLAY=:1 \
     BROWSER_BIN=/usr/bin/${BROWSER} \
     BROWSER_EXTRA_ARGS= \
     HUMANCURSOR_PYTHON=/opt/sagasu-humancursor/bin/python \
+    SAGASU_IDLE_ENABLED=1 \
+    SAGASU_IDLE_AFTER_SECONDS=5 \
+    SAGASU_IDLE_RADIUS_PX=300 \
+    SAGASU_IDLE_MIN_DURATION_SECONDS=0.3 \
+    SAGASU_IDLE_MAX_DURATION_SECONDS=2 \
     SAGASU_NO_SANDBOX= \
     SAGASU_USER=sagasu \
     HOME=/home/sagasu \

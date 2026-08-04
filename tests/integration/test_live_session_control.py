@@ -2,6 +2,10 @@
 
 Run with:
     SAGASU_LIVE_CONTAINER=sagasu-preview pytest -m live tests/integration
+
+Idle-specific check (container must have idle mode enabled):
+    SAGASU_LIVE_CONTAINER=sagasu-preview SAGASU_LIVE_IDLE=1 \
+        pytest -m live tests/integration
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import pytest
 pytestmark = pytest.mark.live
 CONTAINER = os.environ.get("SAGASU_LIVE_CONTAINER")
 SECOND_CONTAINER = os.environ.get("SAGASU_LIVE_CONTAINER_2")
+LIVE_IDLE = os.environ.get("SAGASU_LIVE_IDLE") == "1"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -45,6 +50,35 @@ def executor(
         check=False,
         text=not binary,
     )
+
+
+def raw_pointer(container: str | None = CONTAINER) -> tuple[int, int]:
+    if not container:
+        pytest.skip("SAGASU_LIVE_CONTAINER is not set")
+    result = subprocess.run(
+        [
+            "docker",
+            "exec",
+            "--user",
+            "sagasu",
+            container,
+            "xdotool",
+            "getmouselocation",
+            "--shell",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    fields = dict(
+        line.split("=", 1)
+        for line in result.stdout.splitlines()
+        if "=" in line
+    )
+    return int(fields["X"]), int(fields["Y"])
 
 
 def test_live_display_move_and_screenshot():
@@ -291,3 +325,58 @@ def test_live_same_display_number_is_container_isolated():
     assert first_png.startswith(b"\x89PNG\r\n\x1a\n")
     assert second_png.startswith(b"\x89PNG\r\n\x1a\n")
     assert first_png != second_png
+
+
+def test_live_idle_motion_yields_to_human_pause():
+    if not LIVE_IDLE:
+        pytest.skip("SAGASU_LIVE_IDLE is not set")
+    if not CONTAINER:
+        pytest.skip("SAGASU_LIVE_CONTAINER is not set")
+
+    environment = subprocess.run(
+        ["docker", "exec", CONTAINER, "env"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+    )
+    assert environment.returncode == 0, environment.stderr
+    values = dict(
+        line.split("=", 1)
+        for line in environment.stdout.splitlines()
+        if "=" in line
+    )
+    assert values.get("SAGASU_IDLE_ENABLED", "").casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    after = float(values.get("SAGASU_IDLE_AFTER_SECONDS", "5"))
+    maximum_duration = float(
+        values.get("SAGASU_IDLE_MAX_DURATION_SECONDS", "2")
+    )
+
+    moved = executor("cursor", "move", "400", "300", "--backend", "xdotool")
+    assert moved.returncode == 0, moved.stderr
+    anchor = raw_pointer()
+    deadline = time.monotonic() + after + maximum_duration + 2
+    observed = anchor
+    while time.monotonic() < deadline and observed == anchor:
+        time.sleep(0.03)
+        observed = raw_pointer()
+    assert observed != anchor
+
+    paused = False
+    try:
+        result = executor("human", "pause")
+        assert result.returncode == 0, result.stderr
+        paused = True
+        position = raw_pointer()
+        time.sleep(0.5)
+        assert raw_pointer() == position
+    finally:
+        if paused:
+            resumed = executor("human", "resume")
+            assert resumed.returncode == 0, resumed.stderr

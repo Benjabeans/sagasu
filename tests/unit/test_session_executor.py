@@ -14,6 +14,7 @@ from sagasu.cdp.locate import ElementLocation
 from sagasu.cdp.navigate import NavigationResult
 from sagasu.cli import session_executor as cli
 from sagasu.protocol import SagasuError
+from sagasu.sessions.activity import paths_for_lock, read_activity
 from sagasu.sessions.locking import session_lock
 from sagasu.xcontrol.cursor import XDoToolBackend, create_backend
 from sagasu.xcontrol.display import DisplaySize, PointerPosition
@@ -381,6 +382,23 @@ def test_shared_locks_allow_parallel_readers(tmp_path):
     with session_lock(exclusive=False, path=lock_path):
         with session_lock(exclusive=False, path=lock_path):
             pass
+
+
+def test_every_executor_command_records_idle_activity(monkeypatch, tmp_path):
+    install_fake_display(monkeypatch)
+    lock_path = tmp_path / "control.lock"
+    activity_path, _ = paths_for_lock(lock_path)
+    arguments = cli.build_parser().parse_args(["display"])
+
+    cli.execute(
+        arguments,
+        text_stdout=io.StringIO(),
+        lock_path=lock_path,
+        pause_path=tmp_path / "paused",
+    )
+
+    # Entering and leaving the command each advance the epoch.
+    assert read_activity(activity_path) >= 2
 
 
 def test_xdotool_scroll_direction_and_no_human_fallback():

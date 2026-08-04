@@ -21,6 +21,7 @@ test = [
 
 [project.scripts]
 sagasu = "sagasu.cli.main:main"
+sagasu-idle-daemon = "sagasu.cli.idle_daemon:main"
 sagasu-session-exec = "sagasu.cli.session_executor:main"
 sagasu-xcontrol = "sagasu.cli.session_executor:main"
 
