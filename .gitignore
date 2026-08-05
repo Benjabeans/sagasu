@@ -7,4 +7,5 @@ dist/
 .claude/
 tailnet-novnc-browser-handoff.md
 notes.txt
-
+package.json
+package-lock.json
