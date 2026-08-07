@@ -8,8 +8,17 @@ from typing import Any
 from sagasu.cdp.insert_text import validate_insert_text
 from sagasu.cdp.locate import validate_selector
 from sagasu.cdp.navigate import validate_navigation_url
+from sagasu.cli.action_sequence import (
+    encode_action_sequence,
+    parse_action_sequence,
+    validate_settle_ms,
+)
 from sagasu.protocol import SagasuError
-from sagasu.sessions.artifacts import save_dom, save_screenshot
+from sagasu.sessions.artifacts import (
+    save_action_sequence_screenshot,
+    save_dom,
+    save_screenshot,
+)
 from sagasu.sessions.docker import DockerCLI
 from sagasu.sessions.executor import SessionExecutor
 from sagasu.sessions.resolver import resolve_session
@@ -40,6 +49,13 @@ def run(arguments: argparse.Namespace, docker: DockerCLI) -> dict[str, Any]:
             overwrite=arguments.overwrite,
         )
     assert runtime_arguments is not None
+    if arguments.session_command == "sequence":
+        return save_action_sequence_screenshot(
+            executor,
+            arguments.out,
+            executor_arguments=runtime_arguments,
+            overwrite=arguments.overwrite,
+        )
     return executor.invoke(runtime_arguments)
 
 
@@ -56,6 +72,20 @@ def _runtime_arguments(arguments: argparse.Namespace) -> list[str]:
     if command == "insert-text":
         validate_insert_text(arguments.text)
         return ["insert-text", "--", arguments.text]
+    if command == "sequence":
+        actions = parse_action_sequence(arguments.actions_json)
+        runtime = [
+            "sequence",
+            "--actions-json",
+            encode_action_sequence(actions),
+        ]
+        if arguments.settle_ms is not None:
+            runtime.extend(
+                ["--settle-ms", str(validate_settle_ms(arguments.settle_ms))]
+            )
+        if arguments.no_pointer:
+            runtime.append("--no-pointer")
+        return runtime
     if command != "cursor":  # pragma: no cover - parser constrains this
         raise SagasuError(
             "invalid_arguments",

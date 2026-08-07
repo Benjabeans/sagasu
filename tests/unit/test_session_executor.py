@@ -5,6 +5,7 @@ import io
 import json
 import os
 import subprocess
+from contextlib import contextmanager
 
 import pytest
 
@@ -13,6 +14,7 @@ from sagasu.cdp.insert_text import TextInsertionResult
 from sagasu.cdp.locate import ElementLocation
 from sagasu.cdp.navigate import NavigationResult
 from sagasu.cli import session_executor as cli
+from sagasu.cli.action_sequence import SequenceExecution
 from sagasu.protocol import SagasuError
 from sagasu.sessions.activity import paths_for_lock, read_activity
 from sagasu.sessions.locking import session_lock
@@ -289,6 +291,206 @@ def test_cdp_element_location_reports_absolute_screen_point(
     assert payload["screen"] == {"x": 40, "y": 50}
     assert payload["viewport"]["point"] == {"x": 40, "y": 30}
     assert payload["mapping"]["viewport_origin"] == {"x": 0, "y": 20}
+
+
+def test_sequence_holds_one_lock_through_delay_and_screenshot(
+    monkeypatch, tmp_path
+):
+    install_fake_display(monkeypatch)
+    locked = False
+    events = []
+
+    @contextmanager
+    def tracking_lock(*, exclusive, path):
+        nonlocal locked
+        del path
+        assert exclusive is True
+        assert locked is False
+        locked = True
+        events.append("lock.enter")
+        try:
+            yield
+        finally:
+            events.append("lock.exit")
+            locked = False
+
+    def run(actions, display):
+        assert locked is True
+        events.append(("run", len(actions), display))
+        return SequenceExecution(
+            (
+                {
+                    "ok": True,
+                    "index": 0,
+                    "operation": "cursor.move",
+                    "backend": "humancursor",
+                    "display": {"width": 100, "height": 80},
+                    "pointer": {"x": 12, "y": 13},
+                },
+            )
+        )
+
+    def settle(seconds):
+        assert locked is True
+        events.append(("sleep", seconds))
+
+    def capture(destination, *, include_pointer):
+        assert locked is True
+        events.append(("capture", include_pointer))
+        destination.write(b"PNG")
+
+    monkeypatch.setattr(cli, "session_lock", tracking_lock)
+    monkeypatch.setattr(cli, "run_action_sequence", run)
+    monkeypatch.setattr(cli, "stream_png", capture)
+    binary = io.BytesIO()
+    metadata = io.StringIO()
+    arguments = cli.build_parser().parse_args(
+        [
+            "sequence",
+            "--actions-json",
+            '[{"operation":"cursor.move","x":20,"y":30}]',
+        ]
+    )
+
+    cli.execute(
+        arguments,
+        binary_stdout=binary,
+        metadata_stream=metadata,
+        lock_path=tmp_path / "control.lock",
+        pause_path=tmp_path / "paused",
+        environ={},
+        sleep=settle,
+    )
+
+    assert binary.getvalue() == b"PNG"
+    assert events == [
+        "lock.enter",
+        ("run", 1, DisplaySize(100, 80)),
+        ("sleep", 1.0),
+        ("capture", True),
+        "lock.exit",
+    ]
+    payload = json.loads(metadata.getvalue())
+    assert payload["operation"] == "actions.sequence"
+    assert payload["completed"] is True
+    assert payload["action_count"] == 1
+    assert payload["actions_completed"] == 1
+    assert payload["settle_ms"] == 1_000
+    assert payload["pointer_included"] is True
+
+
+def test_failed_sequence_still_waits_and_captures(monkeypatch, tmp_path):
+    install_fake_display(monkeypatch)
+    sleeps = []
+    captures = []
+    failure = SagasuError("input_failed", "the click failed", {"backend": "fake"})
+    monkeypatch.setattr(
+        cli,
+        "run_action_sequence",
+        lambda actions, display: SequenceExecution((), failure, 0),
+    )
+    monkeypatch.setattr(
+        cli,
+        "stream_png",
+        lambda destination, *, include_pointer: (
+            captures.append(include_pointer),
+            destination.write(b"diagnostic"),
+        )[-1],
+    )
+    binary = io.BytesIO()
+    metadata = io.StringIO()
+    arguments = cli.build_parser().parse_args(
+        [
+            "sequence",
+            "--actions-json",
+            '[{"operation":"cursor.click","x":20,"y":30}]',
+            "--settle-ms",
+            "250",
+            "--no-pointer",
+        ]
+    )
+
+    cli.execute(
+        arguments,
+        binary_stdout=binary,
+        metadata_stream=metadata,
+        lock_path=tmp_path / "control.lock",
+        pause_path=tmp_path / "paused",
+        environ={},
+        sleep=sleeps.append,
+    )
+
+    payload = json.loads(metadata.getvalue())
+    assert binary.getvalue() == b"diagnostic"
+    assert sleeps == [0.25]
+    assert captures == [False]
+    assert payload["completed"] is False
+    assert payload["failed_index"] == 0
+    assert payload["failure"] == {
+        "code": "input_failed",
+        "message": "the click failed",
+        "details": {"backend": "fake"},
+    }
+
+
+def test_sequence_limit_is_container_enforced_before_actions(
+    monkeypatch, tmp_path
+):
+    install_fake_display(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "run_action_sequence",
+        lambda actions, display: pytest.fail("actions must not run"),
+    )
+    actions = [
+        {"operation": "cursor.move", "x": index, "y": index}
+        for index in range(4)
+    ]
+    arguments = cli.build_parser().parse_args(
+        ["sequence", "--actions-json", json.dumps(actions)]
+    )
+
+    with pytest.raises(SagasuError) as error:
+        cli.execute(
+            arguments,
+            binary_stdout=io.BytesIO(),
+            metadata_stream=io.StringIO(),
+            lock_path=tmp_path / "control.lock",
+            pause_path=tmp_path / "paused",
+            environ={"SAGASU_SEQUENCE_MAX_ACTIONS": "3"},
+            sleep=lambda seconds: None,
+        )
+    assert error.value.code == "sequence_too_long"
+
+
+def test_human_pause_blocks_sequence_before_actions(monkeypatch, tmp_path):
+    install_fake_display(monkeypatch)
+    paused = tmp_path / "paused"
+    paused.write_text("paused\n")
+    monkeypatch.setattr(
+        cli,
+        "run_action_sequence",
+        lambda actions, display: pytest.fail("actions must not run"),
+    )
+    arguments = cli.build_parser().parse_args(
+        [
+            "sequence",
+            "--actions-json",
+            '[{"operation":"cursor.move","x":20,"y":30}]',
+        ]
+    )
+
+    with pytest.raises(SagasuError) as error:
+        cli.execute(
+            arguments,
+            binary_stdout=io.BytesIO(),
+            metadata_stream=io.StringIO(),
+            lock_path=tmp_path / "control.lock",
+            pause_path=paused,
+            environ={},
+            sleep=lambda seconds: None,
+        )
+    assert error.value.code == "human_control"
 
 
 @pytest.mark.parametrize(

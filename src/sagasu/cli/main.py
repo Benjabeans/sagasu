@@ -107,6 +107,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_target(insert_text)
     insert_text.add_argument("text")
 
+    sequence = session_commands.add_parser(
+        "sequence",
+        help="apply bounded input actions and capture the resulting display",
+    )
+    _add_target(sequence)
+    sequence.add_argument("--actions-json", required=True)
+    sequence.add_argument("--settle-ms", type=int)
+    sequence.add_argument("--out", required=True)
+    sequence.add_argument("--no-pointer", action="store_true")
+    sequence.add_argument("--overwrite", action="store_true")
+
     cursor = session_commands.add_parser(
         "cursor", help="inspect or drive the real X cursor"
     )

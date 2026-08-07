@@ -207,6 +207,9 @@ class DockerCLI:
         container_id: str,
         arguments: Sequence[str],
         destination: BinaryIO,
+        *,
+        failure_code: str = "dom_failed",
+        failure_message: str = "The in-container DOM command failed",
     ) -> dict[str, Any]:
         """Stream stdout while receiving a JSON result on stderr."""
 
@@ -214,8 +217,8 @@ class DockerCLI:
             container_id,
             arguments,
             destination,
-            failure_code="dom_failed",
-            failure_message="The in-container DOM command failed",
+            failure_code=failure_code,
+            failure_message=failure_message,
         )
         payload = _executor_result(stderr)
         if payload is None:

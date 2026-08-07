@@ -102,6 +102,64 @@ def test_live_display_move_and_screenshot():
     assert screenshot.stdout.startswith(b"\x89PNG\r\n\x1a\n")
 
 
+def test_live_action_sequence_returns_one_final_screenshot(tmp_path):
+    if not CONTAINER:
+        pytest.skip("SAGASU_LIVE_CONTAINER is not set")
+    actions = json.dumps(
+        [
+            {
+                "operation": "cursor.move",
+                "x": 200,
+                "y": 200,
+                "backend": "xdotool",
+            },
+            {
+                "operation": "cursor.move",
+                "x": 250,
+                "y": 225,
+                "backend": "xdotool",
+            },
+        ]
+    )
+    output = tmp_path / "sequence.png"
+    host = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "sagasu.cli.main",
+            "session",
+            "sequence",
+            "--container",
+            CONTAINER,
+            "--actions-json",
+            actions,
+            "--settle-ms",
+            "10",
+            "--out",
+            str(output),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+        cwd=REPOSITORY_ROOT,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(REPOSITORY_ROOT / "src"),
+        },
+    )
+
+    assert host.returncode == 0, host.stderr
+    payload = json.loads(host.stdout)
+    assert payload["operation"] == "actions.sequence"
+    assert payload["completed"] is True
+    assert payload["actions_completed"] == 2
+    assert payload["settle_ms"] == 10
+    assert payload["pointer"] == {"x": 250, "y": 225}
+    assert output.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
 def test_live_legacy_xcontrol_alias_remains_available():
     if not CONTAINER:
         pytest.skip("SAGASU_LIVE_CONTAINER is not set")

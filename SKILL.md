@@ -97,6 +97,50 @@ Use atomic actions with explicit coordinates. Do not use `--current`, and do
 not select the `xdotool` mouse backend unless the user specifically requests
 debugging of that fallback.
 
+Queue up to three deterministic mutations when no intermediate visual decision
+is needed. The command waits one second after the final action and
+automatically captures the full display:
+
+```bash
+PYTHONPATH=src python3 -m sagasu.cli.main session sequence \
+  --container sagasu-preview \
+  --actions-json '[
+    {"operation":"cursor.click","x":650,"y":312},
+    {"operation":"text.insert","text":"apples"},
+    {"operation":"cursor.click","x":603,"y":386}
+  ]' \
+  --out /tmp/sagasu-preview.png --overwrite
+```
+
+Immediately open the returned `output` path with `view_image`; the sequence
+already took the post-action screenshot, so do not issue a second screenshot
+first. If a sequence fails after starting, its structured error still includes
+the diagnostic screenshot path and zero-based `failed_index`; inspect that
+image before deciding whether recovery is safe.
+
+Queueable operations are `cursor.move`, `cursor.click`, `cursor.drag`,
+`cursor.scroll`, `text.insert`, and `page.navigate`. Navigation can only be the
+final action. Screenshot, DOM, locate, display, pointer observation, and human
+pause/resume are never queue entries and must remain individual commands.
+
+Use these action fields:
+
+- `cursor.move`: `x`, `y`; optional `duration_ms`, `steady`, `backend`.
+- `cursor.click`: `x`, `y`; optional `button`, `count`, `hold_ms`, `backend`.
+- `cursor.drag`: `x1`, `y1`, `x2`, `y2`; optional `duration_ms`, `steady`,
+  `backend`.
+- `cursor.scroll`: `x`, `y`, `steps`; optional `backend`.
+- `text.insert`: `text`.
+- `page.navigate`: absolute HTTP(S) `url`.
+
+HumanCursor is the default backend for queued cursor actions too. Do not put
+`null` in optional fields; omit fields that are not being set.
+
+The limit is a maximum, not a target. Use one action whenever an intermediate
+click can open a menu, suggestion list, overlay, login, CAPTCHA, or otherwise
+move the next target. Only batch coordinates grounded in the same fresh
+screenshot whose layout is expected to remain stable throughout the sequence.
+
 ## Follow the vision-first loop
 
 1. Capture and inspect the full display:
@@ -138,7 +182,9 @@ debugging of that fallback.
    coordinate when a visible overlay, browser popup, or page motion makes it
    stale or obstructed.
 
-5. Take one small X-level action. Clicking uses HumanCursor by default:
+5. Take one small X-level action, or a bounded sequence when every later action
+   is safe without intermediate observation. Clicking uses HumanCursor by
+   default:
 
    ```bash
    PYTHONPATH=src python3 -m sagasu.cli.main session cursor --container sagasu-preview click X Y
@@ -146,8 +192,10 @@ debugging of that fallback.
    PYTHONPATH=src python3 -m sagasu.cli.main session cursor --container sagasu-preview drag X1 Y1 X2 Y2
    ```
 
-6. Capture and visually inspect a fresh screenshot to verify the result. Fetch
-   a new DOM only if the new state requires detailed reading or extraction.
+6. After a standalone action, capture and visually inspect a fresh screenshot.
+   After a sequence, immediately inspect its automatically produced `output`
+   image instead. Fetch a new DOM only if the new state requires detailed
+   reading or extraction.
 
 ## Prefer the website's search interface
 
@@ -158,10 +206,12 @@ available and convenient:
    landing page supplied by the user.
 2. Capture and inspect a screenshot, then visually find the site's search
    field. Use DOM or `locate` only if the control is ambiguous.
-3. Click the field through X input, insert the query, and click the visible
-   search/submit control through X input.
-4. Capture and inspect the results screenshot; use DOM afterward only when the
-   result details need structured extraction.
+3. Click the field through X input and insert the query. Queue the visible
+   submit click only when text entry cannot open suggestions or move/cover the
+   target; otherwise inspect the intermediate screen first.
+4. Inspect the sequence's automatic result screenshot, or capture one after a
+   standalone submit action. Use DOM afterward only when the result details
+   need structured extraction.
 
 Prefer this over constructing and directly navigating to a search-results URL
 merely to skip the site's interface. Direct navigation remains appropriate
@@ -178,8 +228,9 @@ PYTHONPATH=src python3 -m sagasu.cli.main session navigate --container sagasu-pr
 
 This accepts only absolute HTTP(S) URLs and returns when Chromium accepts the
 navigation, not when loading finishes. Capture and inspect a fresh screenshot
-before acting. Do not fetch the DOM unless the destination needs detailed
-reading or extraction.
+before acting. If navigation is placed in a sequence it must be last, and the
+sequence supplies that screenshot after its settle delay. Do not fetch the DOM
+unless the destination needs detailed reading or extraction.
 
 Click a normal text field through X before inserting text into it. Use CDP text
 insertion, particularly for Unicode that the X keyboard map cannot represent:

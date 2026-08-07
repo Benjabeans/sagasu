@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import struct
 import zlib
 from concurrent.futures import ThreadPoolExecutor
@@ -10,7 +11,11 @@ import pytest
 from sagasu.artifacts.html import validate_html
 from sagasu.artifacts.png import validate_png
 from sagasu.protocol import SagasuError
-from sagasu.sessions.artifacts import save_dom, save_screenshot
+from sagasu.sessions.artifacts import (
+    save_action_sequence_screenshot,
+    save_dom,
+    save_screenshot,
+)
 from sagasu.sessions.executor import SessionExecutor
 from sagasu.sessions.models import ResolvedSession
 
@@ -37,6 +42,7 @@ class FakeDocker:
         self.error = error
         self.stream_names = []
         self.stream_arguments = []
+        self.stream_json_kwargs = []
 
     def exec_stream(self, container_id, arguments, destination):
         self.stream_names.append(destination.name)
@@ -54,7 +60,43 @@ class FakeDocker:
             "pointer": {"x": 10, "y": 20},
         }
 
-    def exec_stream_json(self, container_id, arguments, destination):
+    def exec_stream_json(
+        self,
+        container_id,
+        arguments,
+        destination,
+        **kwargs,
+    ):
+        self.stream_names.append(destination.name)
+        self.stream_arguments.append((container_id, list(arguments)))
+        self.stream_json_kwargs.append(kwargs)
+        if arguments[0] == "sequence":
+            destination.write(self.image)
+            action_document = arguments[arguments.index("--actions-json") + 1]
+            action_count = len(json.loads(action_document))
+            return {
+                "ok": True,
+                "operation": "actions.sequence",
+                "backend": "mixed",
+                "display": {"width": 2, "height": 3},
+                "pointer": {"x": 10, "y": 20},
+                "completed": True,
+                "action_count": action_count,
+                "actions_completed": action_count,
+                "settle_ms": 1_000,
+                "pointer_included": "--no-pointer" not in arguments,
+                "results": [
+                    {
+                        "ok": True,
+                        "index": index,
+                        "operation": "cursor.move",
+                        "backend": "humancursor",
+                        "display": {"width": 2, "height": 3},
+                        "pointer": {"x": 10, "y": 20},
+                    }
+                    for index in range(action_count)
+                ],
+            }
         document = "<!doctype html><html><body>live</body></html>".encode()
         destination.write(document)
         return {
@@ -113,6 +155,109 @@ def test_no_pointer_is_forwarded(tmp_path):
         overwrite=False,
     )
     assert docker.stream_arguments[0][1] == ["screenshot", "--no-pointer"]
+
+
+def test_sequence_screenshot_is_validated_and_published(tmp_path):
+    docker = FakeDocker()
+    output = tmp_path / "sequence.png"
+    arguments = [
+        "sequence",
+        "--actions-json",
+        '[{"operation":"cursor.move","x":1,"y":2}]',
+    ]
+
+    payload = save_action_sequence_screenshot(
+        SessionExecutor(docker, SESSION),
+        output,
+        executor_arguments=arguments,
+        overwrite=False,
+    )
+
+    assert output.read_bytes() == png()
+    assert payload["operation"] == "actions.sequence"
+    assert payload["completed"] is True
+    assert payload["output"] == str(output)
+    assert payload["session_id"] == SESSION.session_id
+    assert docker.stream_arguments == [("abc123", arguments)]
+    assert docker.stream_json_kwargs == [
+        {
+            "failure_code": "sequence_failed",
+            "failure_message": "The in-container action sequence failed",
+        }
+    ]
+
+
+def test_failed_sequence_keeps_diagnostic_screenshot(tmp_path):
+    class FailedSequenceDocker(FakeDocker):
+        def exec_stream_json(self, container_id, arguments, destination, **kwargs):
+            payload = super().exec_stream_json(
+                container_id, arguments, destination, **kwargs
+            )
+            payload.update(
+                {
+                    "completed": False,
+                    "actions_completed": 0,
+                    "results": [],
+                    "failed_index": 0,
+                    "failure": {
+                        "code": "input_failed",
+                        "message": "the movement failed",
+                        "details": {"backend": "humancursor"},
+                    },
+                }
+            )
+            return payload
+
+    output = tmp_path / "failed-sequence.png"
+    arguments = [
+        "sequence",
+        "--actions-json",
+        '[{"operation":"cursor.move","x":1,"y":2}]',
+    ]
+    with pytest.raises(SagasuError) as error:
+        save_action_sequence_screenshot(
+            SessionExecutor(FailedSequenceDocker(), SESSION),
+            output,
+            executor_arguments=arguments,
+            overwrite=False,
+        )
+
+    assert error.value.code == "input_failed"
+    assert error.value.details == {
+        "backend": "humancursor",
+        "output": str(output),
+        "failed_index": 0,
+        "actions_completed": 0,
+        "action_count": 1,
+    }
+    assert output.read_bytes() == png()
+
+
+def test_invalid_sequence_metadata_leaves_no_destination(tmp_path):
+    class InvalidSequenceDocker(FakeDocker):
+        def exec_stream_json(self, container_id, arguments, destination, **kwargs):
+            payload = super().exec_stream_json(
+                container_id, arguments, destination, **kwargs
+            )
+            payload["results"][0]["text"] = "must not cross the protocol"
+            return payload
+
+    output = tmp_path / "invalid-sequence.png"
+    arguments = [
+        "sequence",
+        "--actions-json",
+        '[{"operation":"cursor.move","x":1,"y":2}]',
+    ]
+    with pytest.raises(SagasuError) as error:
+        save_action_sequence_screenshot(
+            SessionExecutor(InvalidSequenceDocker(), SESSION),
+            output,
+            executor_arguments=arguments,
+            overwrite=False,
+        )
+
+    assert error.value.code == "invalid_response"
+    assert not output.exists()
 
 
 def test_existing_output_requires_overwrite(tmp_path):
@@ -230,9 +375,15 @@ def test_dom_validates_and_atomically_publishes(tmp_path):
 
 def test_invalid_dom_metadata_leaves_no_destination(tmp_path):
     class InvalidMetadataDocker(FakeDocker):
-        def exec_stream_json(self, container_id, arguments, destination):
+        def exec_stream_json(
+            self,
+            container_id,
+            arguments,
+            destination,
+            **kwargs,
+        ):
             payload = super().exec_stream_json(
-                container_id, arguments, destination
+                container_id, arguments, destination, **kwargs
             )
             payload["bytes"] += 1
             return payload

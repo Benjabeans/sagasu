@@ -9,7 +9,7 @@ from sagasu.artifacts.atomic import publish_stream
 from sagasu.artifacts.html import validate_html
 from sagasu.artifacts.png import validate_png
 from sagasu.protocol import SagasuError
-from sagasu.sessions.executor import SessionExecutor
+from sagasu.sessions.executor import SessionExecutor, validate_executor_result
 
 
 def save_screenshot(
@@ -41,6 +41,34 @@ def save_screenshot(
         "pointer_included": include_pointer,
         "display": {"width": width, "height": height},
     }
+
+
+def save_action_sequence_screenshot(
+    executor: SessionExecutor,
+    destination: Path | str,
+    *,
+    executor_arguments: list[str],
+    overwrite: bool,
+) -> dict[str, Any]:
+    """Apply one action sequence and atomically publish its final screenshot."""
+
+    artifact = publish_stream(
+        destination,
+        overwrite=overwrite,
+        artifact_name="sequence screenshot",
+        stream_writer=lambda stream: executor.stream_json(
+            executor_arguments,
+            stream,
+            failure_code="sequence_failed",
+            failure_message="The in-container action sequence failed",
+        ),
+        validator=_validate_action_sequence_artifact,
+    )
+    payload = artifact.stream_result
+    payload["output"] = str(artifact.path)
+    if payload["completed"] is not True:
+        _raise_action_sequence_failure(payload, artifact.path)
+    return payload
 
 
 def save_dom(
@@ -91,3 +119,127 @@ def _validate_dom_artifact(path: Path, payload: dict[str, Any]) -> int:
             "The session executor returned incomplete DOM metadata",
         )
     return byte_count
+
+
+def _validate_action_sequence_artifact(
+    path: Path, payload: dict[str, Any]
+) -> tuple[int, int]:
+    width, height = validate_png(path)
+    if payload.get("operation") != "actions.sequence":
+        raise SagasuError(
+            "invalid_response",
+            "The session executor returned the wrong sequence operation",
+        )
+    completed = payload.get("completed")
+    if not isinstance(completed, bool):
+        raise SagasuError(
+            "invalid_response",
+            "The session executor returned an invalid sequence status",
+        )
+    action_count = _payload_integer(payload, "action_count", minimum=1)
+    actions_completed = _payload_integer(
+        payload, "actions_completed", minimum=0
+    )
+    _payload_integer(payload, "settle_ms", minimum=0)
+    results = payload.get("results")
+    if not isinstance(results, list) or len(results) != actions_completed:
+        raise SagasuError(
+            "invalid_response",
+            "The session executor returned invalid sequence results",
+        )
+    for index, result in enumerate(results):
+        if not isinstance(result, dict):
+            raise SagasuError(
+                "invalid_response",
+                "The session executor returned an invalid action result",
+            )
+        validate_executor_result(result)
+        if (
+            result.get("ok") is not True
+            or result.get("index") != index
+            or not isinstance(result.get("operation"), str)
+            or not isinstance(result.get("backend"), str)
+            or result.get("display") != payload.get("display")
+            or "text" in result
+        ):
+            raise SagasuError(
+                "invalid_response",
+                "The session executor returned an inconsistent action result",
+            )
+    if actions_completed > action_count:
+        raise SagasuError(
+            "invalid_response",
+            "The session executor completed too many sequence actions",
+        )
+    if not isinstance(payload.get("pointer_included"), bool):
+        raise SagasuError(
+            "invalid_response",
+            "The session executor returned invalid screenshot metadata",
+        )
+
+    display = payload.get("display")
+    if not isinstance(display, dict) or (
+        display.get("width"), display.get("height")
+    ) != (width, height):
+        raise SagasuError(
+            "invalid_response",
+            "The sequence screenshot dimensions do not match its metadata",
+        )
+    if completed:
+        if actions_completed != action_count or any(
+            key in payload for key in ("failed_index", "failure")
+        ):
+            raise SagasuError(
+                "invalid_response",
+                "The completed sequence returned failure metadata",
+            )
+    else:
+        failed_index = _payload_integer(payload, "failed_index", minimum=0)
+        failure = payload.get("failure")
+        if (
+            failed_index != actions_completed
+            or failed_index >= action_count
+            or not isinstance(failure, dict)
+        ):
+            raise SagasuError(
+                "invalid_response",
+                "The failed sequence returned incomplete failure metadata",
+            )
+        if not all(
+            isinstance(failure.get(key), str) and failure.get(key)
+            for key in ("code", "message")
+        ):
+            raise SagasuError(
+                "invalid_response",
+                "The failed sequence returned an invalid error",
+            )
+    return width, height
+
+
+def _payload_integer(
+    payload: dict[str, Any], name: str, *, minimum: int
+) -> int:
+    value = payload.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise SagasuError(
+            "invalid_response",
+            f"The session executor returned an invalid {name}",
+        )
+    return value
+
+
+def _raise_action_sequence_failure(payload: dict[str, Any], path: Path) -> None:
+    error = SagasuError.from_payload(
+        {"error": payload["failure"]},
+        default_code="sequence_failed",
+    )
+    details = dict(error.details)
+    details.update(
+        {
+            "output": str(path),
+            "failed_index": payload["failed_index"],
+            "actions_completed": payload["actions_completed"],
+            "action_count": payload["action_count"],
+        }
+    )
+    raise SagasuError(error.code, error.message, details)

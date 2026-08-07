@@ -36,11 +36,16 @@ class SessionExecutor:
         self,
         arguments: Sequence[str],
         destination: BinaryIO,
+        *,
+        failure_code: str = "dom_failed",
+        failure_message: str = "The in-container DOM command failed",
     ) -> dict[str, Any]:
         payload = self.docker.exec_stream_json(
             self.session.container_id,
             arguments,
             destination,
+            failure_code=failure_code,
+            failure_message=failure_message,
         )
         validate_executor_result(payload)
         return self.authoritative(payload)
@@ -89,4 +94,3 @@ def _integer_pair(
     if positive:
         return all(item > 0 for item in items)
     return all(item >= 0 for item in items)
-

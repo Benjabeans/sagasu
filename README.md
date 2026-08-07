@@ -102,6 +102,7 @@ sagasu session key <session-id> press|type ...                  # primary: send 
 sagasu session locate <session-id> <css-selector>               # supplemental: DOM target to X-screen coordinates
 sagasu session navigate <session-id> <url>                      # supplemental: direct CDP navigation
 sagasu session insert-text <session-id> <text>                  # supplemental: CDP Unicode text insertion
+sagasu session sequence <session-id> --actions-json <json> --out <path>  # bounded mutations + final screenshot
 sagasu handoff request <session-id> --type captcha|login|other --note "..."   # enqueue for the human, block or poll
 sagasu handoff status <session-id>                             # has the human resolved it?
 sagasu session stop <session-id>                               # tear down (profile persists)
@@ -128,6 +129,7 @@ sagasu session dom SESSION --out PATH [--overwrite]
 sagasu session locate SESSION CSS_SELECTOR
 sagasu session navigate SESSION URL
 sagasu session insert-text SESSION TEXT
+sagasu session sequence SESSION --actions-json JSON --out PATH [--settle-ms N] [--no-pointer] [--overwrite]
 sagasu session cursor SESSION position
 sagasu session cursor SESSION move X Y [--duration-ms N] [--steady]
 sagasu session cursor SESSION click X Y [--button BUTTON] [--count N] [--hold-ms N]
@@ -150,6 +152,58 @@ default, stream directly from the container, and are validated before being
 atomically published at `--out`. A per-container nonblocking lock prevents two
 agents from driving the same cursor; observation takes a shared lock, while
 movement takes an exclusive lock.
+
+### Bounded action sequences
+
+`session sequence` applies up to three input mutations in order, waits one
+second for the visible page to settle, then captures and atomically publishes
+one full-display screenshot at `--out`:
+
+```bash
+sagasu session sequence SESSION \
+  --actions-json '[
+    {"operation":"cursor.click","x":650,"y":312},
+    {"operation":"text.insert","text":"apples"},
+    {"operation":"cursor.click","x":603,"y":386}
+  ]' \
+  --out /tmp/sagasu-after.png --overwrite
+```
+
+The container owns both defaults, so deployments can change them without
+changing the agent-facing command:
+
+```text
+SAGASU_SEQUENCE_MAX_ACTIONS=3
+SAGASU_SEQUENCE_SETTLE_MS=1000
+```
+
+`--settle-ms` overrides the delay for one call and accepts 0–30000 ms. The
+queue limit remains container-authoritative and cannot be raised by a caller.
+Queueable operations are `cursor.move`, `cursor.click`, `cursor.drag`,
+`cursor.scroll`, `text.insert`, and final-position-only `page.navigate`.
+Screenshots, DOM capture, element location, display/pointer observation, and
+human pause/resume are deliberately not actions and remain individual calls.
+The cursor action fields mirror their standalone forms: move uses `x`, `y`,
+optional `duration_ms`/`steady`/`backend`; click uses `x`, `y`, optional
+`button`/`count`/`hold_ms`/`backend`; drag uses `x1`, `y1`, `x2`, `y2` plus
+optional movement fields; and scroll uses `x`, `y`, `steps`, and optional
+`backend`. CDP text uses `text`, while navigation uses an absolute HTTP(S)
+`url`. Unknown fields and JSON `null` values are rejected.
+
+The complete JSON array and every cursor coordinate are validated before the
+first mutation. The sequence then holds one exclusive session lock and one
+idle-activity gate across all actions, the settle delay, and the screenshot,
+so another agent or idle motion cannot interleave. Actions are not
+transactional: if one fails, completed actions remain applied, later actions
+are skipped, and a diagnostic screenshot is still published. The returned
+error includes its path and failed zero-based action index.
+
+Use fewer than three actions whenever an intermediate result needs visual
+judgment. In particular, overlays, autocomplete menus, navigation, login, and
+CAPTCHA can invalidate a later coordinate. `page.navigate` is therefore only
+accepted as the final action. The CLI publishes the screenshot file; a shell-
+driven agent must open that returned path with its image/vision tool. A future
+MCP adapter can return the same PNG bytes as inline image content.
 
 ### Optional idle cursor motion
 
@@ -202,7 +256,7 @@ read-only grounding operation: it neither scrolls nor clicks. An offscreen or
 missing element fails explicitly, and the agent must still compare the result
 with a fresh screenshot before passing it to the X cursor.
 
-`session navigate` sends an absolute HTTP(S) URL to the active page with
+Standalone `session navigate` sends an absolute HTTP(S) URL to the active page with
 `Page.navigate`. It reports when Chromium accepts or rejects the navigation;
 it does not imply that the destination has finished loading, so capture a fresh
 screenshot and DOM afterward. `session insert-text` sends `Input.insertText`
@@ -262,7 +316,8 @@ The boundary remains a deployment choice, not an assumption baked into the code 
 The session container is built: Dockerfile + compose file with Helium (GPG-verified download), TigerVNC, X-level input and display-capture tools (`xdotool` + `scrot`), vendored noVNC, a sandbox-on seccomp profile, and loopback-only internals — verified end-to-end (healthy under compose, CDP reachable from the host only on loopback, clean browser-first shutdown, CJK rendering).
 
 The current slice includes resolved-session display, screenshot, DOM, mouse
-control, direct CDP navigation, and CDP Unicode text insertion. Remaining work
+control, bounded mixed-action sequences with an automatic final screenshot,
+direct CDP navigation, and CDP Unicode text insertion. Remaining work
 includes `setup`/`config`, lifecycle management with named profiles, X keyboard
 control and additional CDP utility verbs, the intervention queue and panel,
 embedded noVNC resume signaling, and the finished agent skill/docs.

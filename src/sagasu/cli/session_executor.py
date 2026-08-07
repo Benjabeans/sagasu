@@ -3,14 +3,31 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import time
 from pathlib import Path
-from typing import Any, BinaryIO, NoReturn, Sequence, TextIO, cast
+from typing import (
+    Any,
+    BinaryIO,
+    Callable,
+    Mapping,
+    NoReturn,
+    Sequence,
+    TextIO,
+    cast,
+)
 
 from sagasu.cdp.dom import stream_active_dom
 from sagasu.cdp.insert_text import insert_text_active_page
 from sagasu.cdp.locate import ElementLocation, locate_active_element
 from sagasu.cdp.navigate import navigate_active_page
+from sagasu.cli.action_sequence import (
+    ActionSequenceConfig,
+    parse_action_sequence,
+    run_action_sequence,
+    validate_sequence_coordinates,
+)
 from sagasu.protocol import SagasuError, success, write_json
 from sagasu.sessions import human_control
 from sagasu.sessions.activity import agent_activity, paths_for_lock
@@ -76,6 +93,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="insert text into the focused page element through CDP",
     )
     insert_text.add_argument("text")
+
+    sequence = commands.add_parser(
+        "sequence",
+        help="apply bounded input actions and stream a final screenshot",
+    )
+    sequence.add_argument("--actions-json", required=True)
+    sequence.add_argument("--settle-ms", type=int)
+    sequence.add_argument("--no-pointer", action="store_true")
 
     cursor = commands.add_parser("cursor", help="inspect or mutate the cursor")
     cursor_commands = cursor.add_subparsers(
@@ -206,6 +231,8 @@ def execute(
     pause_path: Path | str = human_control.PAUSE_PATH,
     activity_path: Path | str | None = None,
     idle_gate_path: Path | str | None = None,
+    environ: Mapping[str, str] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     default_activity_path, default_idle_gate_path = paths_for_lock(lock_path)
     with agent_activity(
@@ -219,6 +246,8 @@ def execute(
             metadata_stream=metadata_stream,
             lock_path=lock_path,
             pause_path=pause_path,
+            environ=os.environ if environ is None else environ,
+            sleep=sleep,
         )
 
 
@@ -230,6 +259,8 @@ def _execute_command(
     metadata_stream: TextIO | None,
     lock_path: Path | str,
     pause_path: Path | str,
+    environ: Mapping[str, str],
+    sleep: Callable[[float], None],
 ) -> None:
     # typeshed types sys.stdout/stderr as "TextIO | Any" because they can be
     # detached; cast so the None-default parameters narrow properly.
@@ -237,6 +268,20 @@ def _execute_command(
         text_stdout = cast(TextIO, sys.stdout)
     if metadata_stream is None:
         metadata_stream = cast(TextIO, sys.stderr)
+    if arguments.command == "sequence":
+        if binary_stdout is None:
+            binary_stdout = cast(BinaryIO, sys.stdout.buffer)
+        _execute_sequence(
+            arguments,
+            binary_stdout=binary_stdout,
+            metadata_stream=metadata_stream,
+            lock_path=lock_path,
+            pause_path=pause_path,
+            environ=environ,
+            sleep=sleep,
+        )
+        return
+
     if arguments.command == "screenshot":
         if binary_stdout is None:
             binary_stdout = cast(BinaryIO, sys.stdout.buffer)
@@ -336,6 +381,59 @@ def _execute_command(
         pause_path=pause_path,
     )
     write_json(payload, text_stdout)
+
+
+def _execute_sequence(
+    arguments: argparse.Namespace,
+    *,
+    binary_stdout: BinaryIO,
+    metadata_stream: TextIO,
+    lock_path: Path | str,
+    pause_path: Path | str,
+    environ: Mapping[str, str],
+    sleep: Callable[[float], None],
+) -> None:
+    config = ActionSequenceConfig.from_environ(environ)
+    actions = parse_action_sequence(
+        arguments.actions_json,
+        max_actions=config.max_actions,
+    )
+    settle_ms = config.effective_settle_ms(arguments.settle_ms)
+
+    with session_lock(exclusive=True, path=lock_path):
+        human_control.require_agent_control(pause_path)
+        display = get_display_size()
+        validate_sequence_coordinates(actions, display)
+        execution = run_action_sequence(actions, display)
+        if settle_ms:
+            sleep(settle_ms / 1000)
+        stream_png(
+            binary_stdout,
+            include_pointer=not arguments.no_pointer,
+        )
+        pointer = get_pointer_position()
+
+    extra: dict[str, object] = {
+        "completed": execution.completed,
+        "action_count": len(actions),
+        "actions_completed": len(execution.results),
+        "settle_ms": settle_ms,
+        "pointer_included": not arguments.no_pointer,
+        "results": list(execution.results),
+    }
+    if execution.failure is not None:
+        extra["failed_index"] = execution.failed_index
+        extra["failure"] = execution.failure.as_dict()["error"]
+    write_json(
+        _result(
+            "actions.sequence",
+            "mixed",
+            display,
+            pointer,
+            **extra,
+        ),
+        metadata_stream,
+    )
 
 
 def _execute_cdp_mutation(
