@@ -16,7 +16,7 @@ from sagasu.cdp.navigate import (
     navigate_active_page,
     validate_navigation_url,
 )
-from sagasu.protocol import SagasuError, success
+from sagasu.protocol import SagasuError
 from sagasu.xcontrol.cursor import create_backend, normalize_button
 from sagasu.xcontrol.cursor.types import CursorBackend
 from sagasu.xcontrol.display import (
@@ -258,6 +258,23 @@ def validate_sequence_coordinates(
             )
 
 
+def prepare_cursor_backends(
+    actions: Sequence[SequenceAction],
+    *,
+    backend_factory: Callable[[str], CursorBackend] = create_backend,
+) -> dict[str, CursorBackend]:
+    """Construct each cursor backend before sequence execution begins."""
+
+    backends: dict[str, CursorBackend] = {}
+    for action in actions:
+        if isinstance(
+            action,
+            (CursorMove, CursorClick, CursorDrag, CursorScroll),
+        ) and action.backend not in backends:
+            backends[action.backend] = backend_factory(action.backend)
+    return backends
+
+
 def run_action_sequence(
     actions: Sequence[SequenceAction],
     display: DisplaySize,
@@ -267,7 +284,7 @@ def run_action_sequence(
     insert_text: Callable[[str], TextInsertionResult] = insert_text_active_page,
     navigate: Callable[[str], NavigationResult] = navigate_active_page,
 ) -> SequenceExecution:
-    """Apply validated actions in order, stopping at the first expected failure."""
+    """Apply actions in order, stopping at the first mutation failure."""
 
     backends: dict[str, CursorBackend] = {}
     results: list[dict[str, Any]] = []
@@ -278,13 +295,13 @@ def run_action_sequence(
                 display,
                 backends=backends,
                 backend_factory=backend_factory,
-                pointer_position=pointer_position,
                 insert_text=insert_text,
                 navigate=navigate,
             )
         except SagasuError as error:
             return SequenceExecution(tuple(results), error, index)
         result["index"] = index
+        _record_pointer_observation(result, pointer_position)
         results.append(result)
     return SequenceExecution(tuple(results))
 
@@ -405,17 +422,15 @@ def _run_action(
     *,
     backends: dict[str, CursorBackend],
     backend_factory: Callable[[str], CursorBackend],
-    pointer_position: Callable[[], PointerPosition],
     insert_text: Callable[[str], TextInsertionResult],
     navigate: Callable[[str], NavigationResult],
 ) -> dict[str, Any]:
     if isinstance(action, TextInsert):
         inserted = insert_text(action.text)
-        return _success(
+        return _mutation_success(
             action.operation,
             "cdp",
             display,
-            pointer_position(),
             target_id=inserted.target_id,
             title=inserted.title,
             url=inserted.url,
@@ -424,11 +439,10 @@ def _run_action(
         )
     if isinstance(action, PageNavigate):
         navigated = navigate(action.url)
-        return _success(
+        return _mutation_success(
             action.operation,
             "cdp",
             display,
-            pointer_position(),
             target_id=navigated.target_id,
             requested_url=navigated.requested_url,
             frame_id=navigated.frame_id,
@@ -467,30 +481,42 @@ def _run_action(
     else:
         assert isinstance(action, CursorScroll)
         backend.scroll(action.x, action.y, steps=action.steps)
-    return _success(
+    return _mutation_success(
         action.operation,
         action.backend,
         display,
-        pointer_position(),
     )
 
 
-def _success(
+def _mutation_success(
     operation: str,
     backend: str,
     display: DisplaySize,
-    pointer: PointerPosition,
     **extra: object,
 ) -> dict[str, Any]:
-    return success(
-        operation,
-        backend=backend,
-        width=display.width,
-        height=display.height,
-        pointer_x=pointer.x,
-        pointer_y=pointer.y,
-        **extra,
-    )
+    result: dict[str, Any] = {
+        "ok": True,
+        "operation": operation,
+        "backend": backend,
+        "display": {"width": display.width, "height": display.height},
+    }
+    result.update(extra)
+    return result
+
+
+def _record_pointer_observation(
+    result: dict[str, Any],
+    pointer_position: Callable[[], PointerPosition],
+) -> None:
+    """Attach supplemental pointer state without changing mutation status."""
+
+    try:
+        pointer = pointer_position()
+    except SagasuError as error:
+        result["pointer"] = None
+        result["pointer_observation"] = error.as_dict()
+        return
+    result["pointer"] = {"x": pointer.x, "y": pointer.y}
 
 
 def _check_fields(

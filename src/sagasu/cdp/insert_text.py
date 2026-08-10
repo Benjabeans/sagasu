@@ -29,7 +29,15 @@ class TextInsertionResult:
 def validate_insert_text(text: str) -> None:
     """Reject empty or unreasonably large text before contacting the browser."""
 
-    encoded = text.encode("utf-8")
+    try:
+        encoded = text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise SagasuError(
+            "invalid_arguments",
+            "Text insertion requires valid Unicode text",
+            {"reason": str(exc)},
+            exit_status=2,
+        ) from exc
     if not encoded:
         raise SagasuError(
             "invalid_arguments",

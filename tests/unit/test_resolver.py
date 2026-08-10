@@ -210,3 +210,46 @@ def test_docker_stream_json_keeps_content_and_metadata_separate():
     assert payload == metadata
     assert calls[0][0][-2:] == ["sagasu-session-exec", "dom"]
     assert calls[0][1]["stdin"] is subprocess.DEVNULL
+
+
+def test_docker_sequence_forwards_large_document_on_stdin_not_argv():
+    calls = []
+    communicated = []
+    action_document = (
+        b'[{"operation":"text.insert","text":"'
+        + b"a" * (64 * 1024)
+        + b'"},{"operation":"text.insert","text":"'
+        + b"b" * (64 * 1024)
+        + b'"}]'
+    )
+    metadata = {"ok": True, "operation": "actions.sequence"}
+
+    class Process:
+        returncode = 0
+
+        def communicate(self, input=None):
+            communicated.append(input)
+            return None, (json.dumps(metadata) + "\n").encode()
+
+    def popen(command, **kwargs):
+        calls.append((command, kwargs))
+        kwargs["stdout"].write(b"PNG")
+        return Process()
+
+    output = io.BytesIO()
+    payload = DockerCLI(popen=popen).exec_stream_json(
+        "container-id",
+        ["sequence", "--settle-ms", "1000"],
+        output,
+        input_data=action_document,
+    )
+
+    command, options = calls[0]
+    assert payload == metadata
+    assert output.getvalue() == b"PNG"
+    assert len(action_document) > 131_072
+    assert command[-3:] == ["sequence", "--settle-ms", "1000"]
+    assert "--interactive" in command
+    assert all("a" * 1_000 not in argument for argument in command)
+    assert options["stdin"] is subprocess.PIPE
+    assert communicated == [action_document]

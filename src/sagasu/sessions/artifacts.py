@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from sagasu.artifacts.atomic import publish_stream
+from sagasu.artifacts.atomic import publish_reserved_stream, publish_stream
 from sagasu.artifacts.html import validate_html
 from sagasu.artifacts.png import validate_png
 from sagasu.protocol import SagasuError
@@ -48,22 +48,29 @@ def save_action_sequence_screenshot(
     destination: Path | str,
     *,
     executor_arguments: list[str],
+    executor_input: bytes,
     overwrite: bool,
 ) -> dict[str, Any]:
     """Apply one action sequence and atomically publish its final screenshot."""
 
-    artifact = publish_stream(
-        destination,
-        overwrite=overwrite,
-        artifact_name="sequence screenshot",
-        stream_writer=lambda stream: executor.stream_json(
-            executor_arguments,
-            stream,
-            failure_code="sequence_failed",
-            failure_message="The in-container action sequence failed",
-        ),
-        validator=_validate_action_sequence_artifact,
-    )
+    try:
+        artifact = publish_reserved_stream(
+            destination,
+            overwrite=overwrite,
+            artifact_name="sequence screenshot",
+            stream_writer=lambda stream: executor.stream_json(
+                executor_arguments,
+                stream,
+                input_data=executor_input,
+                failure_code="sequence_failed",
+                failure_message="The in-container action sequence failed",
+            ),
+            validator=_validate_action_sequence_artifact,
+        )
+    except SagasuError as error:
+        if "sequence_state" not in error.details:
+            raise
+        _raise_validated_sequence_observation_failure(executor, error)
     payload = artifact.stream_result
     payload["output"] = str(artifact.path)
     if payload["completed"] is not True:
@@ -130,6 +137,21 @@ def _validate_action_sequence_artifact(
             "invalid_response",
             "The session executor returned the wrong sequence operation",
         )
+    _validate_action_sequence_state(payload)
+
+    display = payload.get("display")
+    assert isinstance(display, dict)
+    if (display.get("width"), display.get("height")) != (width, height):
+        raise SagasuError(
+            "invalid_response",
+            "The sequence screenshot dimensions do not match its metadata",
+        )
+    return width, height
+
+
+def _validate_action_sequence_state(payload: dict[str, Any]) -> None:
+    """Validate mutation status independently of the final screenshot."""
+
     completed = payload.get("completed")
     if not isinstance(completed, bool):
         raise SagasuError(
@@ -153,7 +175,9 @@ def _validate_action_sequence_artifact(
                 "invalid_response",
                 "The session executor returned an invalid action result",
             )
-        validate_executor_result(result)
+        validate_executor_result(
+            result, allow_pointer_observation_failure=True
+        )
         if (
             result.get("ok") is not True
             or result.get("index") != index
@@ -178,12 +202,15 @@ def _validate_action_sequence_artifact(
         )
 
     display = payload.get("display")
-    if not isinstance(display, dict) or (
-        display.get("width"), display.get("height")
-    ) != (width, height):
+    if not isinstance(display, dict) or not all(
+        not isinstance(display.get(name), bool)
+        and isinstance(display.get(name), int)
+        and display[name] > 0
+        for name in ("width", "height")
+    ):
         raise SagasuError(
             "invalid_response",
-            "The sequence screenshot dimensions do not match its metadata",
+            "The session executor returned invalid sequence display dimensions",
         )
     if completed:
         if actions_completed != action_count or any(
@@ -213,7 +240,57 @@ def _validate_action_sequence_artifact(
                 "invalid_response",
                 "The failed sequence returned an invalid error",
             )
-    return width, height
+
+
+def _raise_validated_sequence_observation_failure(
+    executor: SessionExecutor,
+    error: SagasuError,
+) -> None:
+    """Validate container-authored mutation state before surfacing it."""
+
+    state = error.details.get("sequence_state")
+    if not isinstance(state, dict):
+        raise SagasuError(
+            "invalid_response",
+            "The session executor returned invalid sequence failure metadata",
+        ) from error
+    _validate_action_sequence_state(state)
+
+    required_observation = {
+        "observation_stage",
+        "settle_completed",
+        "screenshot_captured",
+        "pointer_observed",
+    }
+    if not required_observation <= state.keys():
+        raise SagasuError(
+            "invalid_response",
+            "The session executor returned incomplete observation failure metadata",
+        ) from error
+    stage = state.get("observation_stage")
+    screenshot_captured = state.get("screenshot_captured")
+    valid_stage = stage in ("screenshot", "pointer")
+    if (
+        not valid_stage
+        or state.get("settle_completed") is not True
+        or state.get("pointer_observed") is not False
+        or not isinstance(screenshot_captured, bool)
+        or screenshot_captured != (stage == "pointer")
+    ):
+        raise SagasuError(
+            "invalid_response",
+            "The session executor returned inconsistent observation failure metadata",
+        ) from error
+
+    details = dict(error.details)
+    details["session_id"] = executor.session.session_id
+    details["container_id"] = executor.session.container_id
+    raise SagasuError(
+        error.code,
+        error.message,
+        details,
+        exit_status=error.exit_status,
+    ) from error
 
 
 def _payload_integer(
@@ -242,4 +319,9 @@ def _raise_action_sequence_failure(payload: dict[str, Any], path: Path) -> None:
             "action_count": payload["action_count"],
         }
     )
-    raise SagasuError(error.code, error.message, details)
+    raise SagasuError(
+        error.code,
+        error.message,
+        details,
+        exit_status=error.exit_status,
+    )

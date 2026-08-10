@@ -5,8 +5,8 @@ import json
 import pytest
 
 from sagasu.cli import session as session_cli
-from sagasu.cli.main import build_parser
-from sagasu.cli.session import _runtime_arguments
+from sagasu.cli.main import build_parser, main
+from sagasu.cli.session import _runtime_arguments, _sequence_invocation
 from sagasu.protocol import SagasuError
 from sagasu.sessions.models import ResolvedSession
 
@@ -233,7 +233,7 @@ def test_runtime_arguments_expose_supplemental_cdp_actions():
     ]
 
 
-def test_runtime_arguments_encode_validated_action_sequence():
+def test_sequence_invocation_separates_validated_actions_from_argv():
     parsed = build_parser().parse_args(
         [
             "session",
@@ -250,9 +250,9 @@ def test_runtime_arguments_encode_validated_action_sequence():
         ]
     )
 
-    runtime = _runtime_arguments(parsed)
-    assert runtime[0:2] == ["sequence", "--actions-json"]
-    assert json.loads(runtime[2]) == [
+    runtime, input_data = _sequence_invocation(parsed)
+    assert runtime == ["sequence", "--settle-ms", "2500", "--no-pointer"]
+    assert json.loads(input_data) == [
         {
             "operation": "cursor.click",
             "x": 10,
@@ -264,7 +264,7 @@ def test_runtime_arguments_encode_validated_action_sequence():
         },
         {"operation": "text.insert", "text": "有線 IEM"},
     ]
-    assert runtime[3:] == ["--settle-ms", "2500", "--no-pointer"]
+    assert "有線 IEM" not in " ".join(runtime)
 
 
 def test_sequence_routes_to_streamed_artifact_handler(monkeypatch):
@@ -292,12 +292,20 @@ def test_sequence_routes_to_streamed_artifact_handler(monkeypatch):
     )
     captured = {}
 
-    def save(executor, destination, *, executor_arguments, overwrite):
+    def save(
+        executor,
+        destination,
+        *,
+        executor_arguments,
+        executor_input,
+        overwrite,
+    ):
         captured.update(
             {
                 "executor": executor,
                 "destination": destination,
                 "arguments": executor_arguments,
+                "input": executor_input,
                 "overwrite": overwrite,
             }
         )
@@ -311,8 +319,72 @@ def test_sequence_routes_to_streamed_artifact_handler(monkeypatch):
     assert payload["operation"] == "actions.sequence"
     assert captured["executor"].docker is docker
     assert captured["destination"] == "screen.png"
-    assert captured["arguments"][0] == "sequence"
+    assert captured["arguments"] == ["sequence"]
+    assert json.loads(captured["input"]) == [
+        {
+            "operation": "cursor.move",
+            "x": 10,
+            "y": 20,
+            "steady": False,
+            "backend": "humancursor",
+        }
+    ]
     assert captured["overwrite"] is True
+
+
+def test_large_valid_sequence_is_forwarded_only_through_stdin(monkeypatch):
+    text_a = "a" * (64 * 1024)
+    text_b = "b" * (64 * 1024)
+    parsed = build_parser().parse_args(
+        [
+            "session",
+            "sequence",
+            SESSION_ID,
+            "--actions-json",
+            json.dumps(
+                [
+                    {"operation": "text.insert", "text": text_a},
+                    {"operation": "text.insert", "text": text_b},
+                ]
+            ),
+            "--out",
+            "screen.png",
+        ]
+    )
+    resolved = ResolvedSession(
+        session_id=SESSION_ID,
+        container_id="container-id",
+        container_name="session",
+    )
+    monkeypatch.setattr(
+        session_cli,
+        "resolve_session",
+        lambda docker, session_id, container: resolved,
+    )
+    captured = {}
+
+    def save(
+        executor,
+        destination,
+        *,
+        executor_arguments,
+        executor_input,
+        overwrite,
+    ):
+        del executor, destination, overwrite
+        captured["arguments"] = executor_arguments
+        captured["input"] = executor_input
+        return {"ok": True, "operation": "actions.sequence"}
+
+    monkeypatch.setattr(session_cli, "save_action_sequence_screenshot", save)
+
+    session_cli.run(parsed, object())
+
+    assert captured["arguments"] == ["sequence"]
+    assert len(captured["input"]) > 131_072
+    assert json.loads(captured["input"])[0]["text"] == text_a
+    assert text_a not in captured["arguments"]
+    assert text_b not in captured["arguments"]
 
 
 def test_invalid_action_arguments_are_structured():
@@ -335,3 +407,37 @@ def test_invalid_action_arguments_are_structured():
     with pytest.raises(SagasuError) as navigation:
         _runtime_arguments(invalid_url)
     assert navigation.value.code == "invalid_arguments"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["session", "insert-text", SESSION_ID, "\ud800"],
+        [
+            "session",
+            "navigate",
+            SESSION_ID,
+            "https://example.test/\udfff",
+        ],
+        [
+            "session",
+            "sequence",
+            SESSION_ID,
+            "--actions-json",
+            r'[{"operation":"text.insert","text":"\ud800"}]',
+            "--out",
+            "screen.png",
+        ],
+    ],
+)
+def test_cli_rejects_lone_unicode_surrogates_as_invalid_arguments(
+    argv, capsys
+):
+    status = main(argv)
+
+    captured = capsys.readouterr()
+    assert status == 2
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload["error"]["code"] == "invalid_arguments"
+    assert payload["error"]["exit_status"] == 2

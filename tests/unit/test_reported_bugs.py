@@ -1,8 +1,4 @@
-"""Executable reproductions for the unresolved defects in ``BUGS.md``.
-
-Each test states the intended behavior. Unresolved defects are strict expected
-failures; fixed defects remain here as ordinary regression tests.
-"""
+"""Regression tests for the original defects recorded in ``BUGS.md``."""
 
 from __future__ import annotations
 
@@ -119,10 +115,6 @@ def test_bug_4_executor_parse_failures_remain_json_only(capsys):
     assert payload["error"]["code"] == "invalid_arguments"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUGS.md #5: standalone SVG and XML DOMs are rejected",
-)
 def test_bug_5_dom_validation_accepts_non_html_documents(tmp_path):
     documents = {
         "image.svg": (
@@ -141,10 +133,6 @@ def test_bug_5_dom_validation_accepts_non_html_documents(tmp_path):
         assert validate_html(path) == len(document.encode("utf-8"))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUGS.md #6: no-overwrite publication requires hard links",
-)
 def test_bug_6_publish_without_overwrite_survives_unsupported_hardlinks(
     monkeypatch, tmp_path
 ):
@@ -167,10 +155,6 @@ def test_bug_6_publish_without_overwrite_survives_unsupported_hardlinks(
     assert published.path == output
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUGS.md #7: executor error exit status is lost at the boundary",
-)
 def test_bug_7_docker_exec_preserves_executor_error_exit_status():
     wire_error = SagasuError(
         "invalid_coordinate",
@@ -197,10 +181,6 @@ def test_bug_7_docker_exec_preserves_executor_error_exit_status():
     assert error.value.exit_status == 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUGS.md #8: optional CDP viewport zoom is required",
-)
 def test_bug_8_missing_cdp_zoom_defaults_to_unzoomed():
     viewport = locate._viewport_metrics(
         {
@@ -214,10 +194,6 @@ def test_bug_8_missing_cdp_zoom_defaults_to_unzoomed():
     assert viewport == ViewportMetrics(width=1351, height=695, zoom=1)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUGS.md #9: malformed Docker UTF-8 escapes structured handling",
-)
 def test_bug_9_non_utf8_docker_listing_is_a_structured_invalid_response():
     def runner(command, **kwargs):
         del kwargs
@@ -232,12 +208,16 @@ def test_bug_9_non_utf8_docker_listing_is_a_structured_invalid_response():
         DockerCLI(runner=runner).containers_for_session(SESSION_ID)
 
     assert error.value.code == "invalid_response"
+    assert error.value.message == (
+        "Docker returned a container listing that is not valid UTF-8"
+    )
+    assert error.value.details == {
+        "encoding": "utf-8",
+        "byte_offset": 0,
+        "reason": "invalid start byte",
+    }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUGS.md #10: cursor backend loading occurs under the lock",
-)
 def test_bug_10_cursor_backend_is_created_before_exclusive_lock(
     monkeypatch, tmp_path
 ):

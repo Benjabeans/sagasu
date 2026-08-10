@@ -161,6 +161,41 @@ def test_horizontal_scrollbar_does_not_shift_screen_coordinates():
     assert (result.screen_x, result.screen_y) == (603, 319)
 
 
+def test_missing_viewport_zoom_defaults_to_unzoomed():
+    without_zoom = responses()
+    del without_zoom["Page.getLayoutMetrics"]["cssVisualViewport"]["zoom"]
+
+    result = locate.locate_active_element(
+        "textarea[name=q]",
+        display_width=1366,
+        display_height=768,
+        client=FakeClient(without_zoom),
+    )
+
+    assert result.scale_x == 1
+    assert result.scale_y == 1
+    assert (result.screen_x, result.screen_y) == (603, 319)
+
+
+@pytest.mark.parametrize(
+    "zoom",
+    [None, True, "1", 0, -1, float("inf"), float("nan")],
+)
+def test_rejects_malformed_or_non_positive_supplied_viewport_zoom(zoom):
+    malformed = responses()
+    malformed["Page.getLayoutMetrics"]["cssVisualViewport"]["zoom"] = zoom
+
+    with pytest.raises(SagasuError) as error:
+        locate.locate_active_element(
+            "textarea[name=q]",
+            display_width=1366,
+            display_height=768,
+            client=FakeClient(malformed),
+        )
+
+    assert error.value.code == "invalid_response"
+
+
 def test_uses_center_of_the_visible_part_of_a_clipped_quad():
     client = FakeClient(
         responses(

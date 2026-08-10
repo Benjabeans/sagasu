@@ -30,7 +30,15 @@ class NavigationResult:
 def validate_navigation_url(url: str) -> None:
     """Require a bounded absolute web URL without silently rewriting it."""
 
-    encoded = url.encode("utf-8")
+    try:
+        encoded = url.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise SagasuError(
+            "invalid_arguments",
+            "The navigation URL requires valid Unicode text",
+            {"reason": str(exc)},
+            exit_status=2,
+        ) from exc
     if not encoded:
         raise SagasuError(
             "invalid_arguments",

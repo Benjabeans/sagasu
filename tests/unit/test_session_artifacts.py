@@ -4,10 +4,11 @@ import json
 import struct
 import zlib
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event
 
 import pytest
 
+from sagasu.artifacts import atomic
 from sagasu.artifacts.html import validate_html
 from sagasu.artifacts.png import validate_png
 from sagasu.protocol import SagasuError
@@ -42,6 +43,7 @@ class FakeDocker:
         self.error = error
         self.stream_names = []
         self.stream_arguments = []
+        self.stream_inputs = []
         self.stream_json_kwargs = []
 
     def exec_stream(self, container_id, arguments, destination):
@@ -65,15 +67,16 @@ class FakeDocker:
         container_id,
         arguments,
         destination,
+        input_data=None,
         **kwargs,
     ):
         self.stream_names.append(destination.name)
         self.stream_arguments.append((container_id, list(arguments)))
+        self.stream_inputs.append(input_data)
         self.stream_json_kwargs.append(kwargs)
         if arguments[0] == "sequence":
             destination.write(self.image)
-            action_document = arguments[arguments.index("--actions-json") + 1]
-            action_count = len(json.loads(action_document))
+            action_count = len(json.loads(input_data))
             return {
                 "ok": True,
                 "operation": "actions.sequence",
@@ -119,6 +122,45 @@ SESSION = ResolvedSession(
 )
 
 
+def observation_failure_state(*, partial_failure=False):
+    results = [
+        {
+            "ok": True,
+            "index": index,
+            "operation": "cursor.move",
+            "backend": "humancursor",
+            "display": {"width": 2, "height": 3},
+            "pointer": {"x": 10, "y": 20},
+        }
+        for index in range(1 if partial_failure else 2)
+    ]
+    state = {
+        "completed": not partial_failure,
+        "action_count": 2,
+        "actions_completed": len(results),
+        "display": {"width": 2, "height": 3},
+        "results": results,
+        "settle_ms": 1_000,
+        "settle_completed": True,
+        "pointer_included": True,
+        "screenshot_captured": False,
+        "pointer_observed": False,
+        "observation_stage": "screenshot",
+    }
+    if partial_failure:
+        state.update(
+            {
+                "failed_index": 1,
+                "failure": {
+                    "code": "input_failed",
+                    "message": "the second movement failed",
+                    "details": {"backend": "humancursor"},
+                },
+            }
+        )
+    return state
+
+
 def test_invoke_adds_host_authoritative_session_metadata():
     payload = SessionExecutor(FakeDocker(), SESSION).invoke(
         ["cursor", "move"]
@@ -162,14 +204,14 @@ def test_sequence_screenshot_is_validated_and_published(tmp_path):
     output = tmp_path / "sequence.png"
     arguments = [
         "sequence",
-        "--actions-json",
-        '[{"operation":"cursor.move","x":1,"y":2}]',
     ]
+    input_data = b'[{"operation":"cursor.move","x":1,"y":2}]'
 
     payload = save_action_sequence_screenshot(
         SessionExecutor(docker, SESSION),
         output,
         executor_arguments=arguments,
+        executor_input=input_data,
         overwrite=False,
     )
 
@@ -179,12 +221,325 @@ def test_sequence_screenshot_is_validated_and_published(tmp_path):
     assert payload["output"] == str(output)
     assert payload["session_id"] == SESSION.session_id
     assert docker.stream_arguments == [("abc123", arguments)]
+    assert docker.stream_inputs == [input_data]
     assert docker.stream_json_kwargs == [
         {
             "failure_code": "sequence_failed",
             "failure_message": "The in-container action sequence failed",
         }
     ]
+
+
+def test_sequence_preexisting_destination_prevents_mutation(tmp_path):
+    docker = FakeDocker()
+    output = tmp_path / "sequence.png"
+    output.write_bytes(b"foreign")
+
+    with pytest.raises(SagasuError) as error:
+        save_action_sequence_screenshot(
+            SessionExecutor(docker, SESSION),
+            output,
+            executor_arguments=["sequence"],
+            executor_input=b'[{"operation":"cursor.move","x":1,"y":2}]',
+            overwrite=False,
+        )
+
+    assert error.value.code == "output_exists"
+    assert docker.stream_arguments == []
+    assert output.read_bytes() == b"foreign"
+    assert not list(tmp_path.glob(f".{output.name}.*.tmp"))
+
+
+def test_concurrent_sequences_reserve_before_mutation(tmp_path):
+    first_mutation_started = Event()
+    allow_first_to_finish = Event()
+
+    class BlockingDocker(FakeDocker):
+        def __init__(self):
+            super().__init__()
+            self.sequence_starts = 0
+
+        def exec_stream_json(
+            self, container_id, arguments, destination, **kwargs
+        ):
+            self.sequence_starts += 1
+            first_mutation_started.set()
+            if not allow_first_to_finish.wait(timeout=2):
+                raise AssertionError("the first sequence was not released")
+            return super().exec_stream_json(
+                container_id, arguments, destination, **kwargs
+            )
+
+    docker = BlockingDocker()
+    executor = SessionExecutor(docker, SESSION)
+    output = tmp_path / "shared-sequence.png"
+
+    def run_sequence():
+        return save_action_sequence_screenshot(
+            executor,
+            output,
+            executor_arguments=["sequence"],
+            executor_input=b'[{"operation":"cursor.move","x":1,"y":2}]',
+            overwrite=False,
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(run_sequence)
+        assert first_mutation_started.wait(timeout=2)
+        try:
+            with pytest.raises(SagasuError) as error:
+                run_sequence()
+            assert error.value.code == "output_exists"
+            # Only the reservation winner was allowed to enter Docker.
+            assert docker.sequence_starts == 1
+            assert output.read_bytes() == b""
+        finally:
+            allow_first_to_finish.set()
+        assert first.result(timeout=2)["completed"] is True
+
+    assert len(docker.stream_arguments) == 1
+    assert output.read_bytes() == png()
+    assert not list(tmp_path.glob(f".{output.name}.*.tmp"))
+
+
+def test_sequence_reservation_does_not_require_hardlinks(
+    monkeypatch, tmp_path
+):
+    def unsupported_hardlink(source, destination):
+        del source, destination
+        raise OSError("hard links are not supported")
+
+    monkeypatch.setattr(atomic.os, "link", unsupported_hardlink)
+    docker = FakeDocker()
+    output = tmp_path / "sequence.png"
+
+    payload = save_action_sequence_screenshot(
+        SessionExecutor(docker, SESSION),
+        output,
+        executor_arguments=["sequence"],
+        executor_input=b'[{"operation":"cursor.move","x":1,"y":2}]',
+        overwrite=False,
+    )
+
+    assert payload["completed"] is True
+    assert len(docker.stream_arguments) == 1
+    assert output.read_bytes() == png()
+
+
+def test_sequence_does_not_clobber_foreign_reservation_replacement(tmp_path):
+    output = tmp_path / "sequence.png"
+
+    class ReplacingDocker(FakeDocker):
+        def exec_stream_json(
+            self, container_id, arguments, destination, **kwargs
+        ):
+            # Simulate a non-cooperating publisher replacing our placeholder
+            # while the browser mutation is in flight.
+            output.unlink()
+            output.write_bytes(b"foreign")
+            return super().exec_stream_json(
+                container_id, arguments, destination, **kwargs
+            )
+
+    docker = ReplacingDocker()
+    with pytest.raises(SagasuError) as error:
+        save_action_sequence_screenshot(
+            SessionExecutor(docker, SESSION),
+            output,
+            executor_arguments=["sequence"],
+            executor_input=b'[{"operation":"cursor.move","x":1,"y":2}]',
+            overwrite=False,
+        )
+
+    assert error.value.code == "output_exists"
+    assert len(docker.stream_arguments) == 1
+    assert output.read_bytes() == b"foreign"
+    assert not list(tmp_path.glob(f".{output.name}.*.tmp"))
+
+
+def test_sequence_temporary_creation_failure_cleans_reservation_before_mutation(
+    monkeypatch, tmp_path
+):
+    def fail_temporary_creation(**kwargs):
+        del kwargs
+        raise OSError("temporary creation failed")
+
+    monkeypatch.setattr(
+        atomic.tempfile, "NamedTemporaryFile", fail_temporary_creation
+    )
+    docker = FakeDocker()
+    output = tmp_path / "sequence.png"
+
+    with pytest.raises(SagasuError) as error:
+        save_action_sequence_screenshot(
+            SessionExecutor(docker, SESSION),
+            output,
+            executor_arguments=["sequence"],
+            executor_input=b'[{"operation":"cursor.move","x":1,"y":2}]',
+            overwrite=False,
+        )
+
+    assert error.value.code == "output_failed"
+    assert docker.stream_arguments == []
+    assert not output.exists()
+    assert not list(tmp_path.glob(f".{output.name}.*.tmp"))
+
+
+def test_failed_sequence_cleans_owned_reservation_and_temporary(tmp_path):
+    class FailingDocker(FakeDocker):
+        def exec_stream_json(
+            self, container_id, arguments, destination, **kwargs
+        ):
+            self.stream_arguments.append((container_id, list(arguments)))
+            destination.write(b"partial")
+            raise SagasuError("sequence_failed", "mutation failed")
+
+    docker = FailingDocker()
+    output = tmp_path / "failed-sequence.png"
+
+    with pytest.raises(SagasuError) as error:
+        save_action_sequence_screenshot(
+            SessionExecutor(docker, SESSION),
+            output,
+            executor_arguments=["sequence"],
+            executor_input=b'[{"operation":"cursor.move","x":1,"y":2}]',
+            overwrite=False,
+        )
+
+    assert error.value.code == "sequence_failed"
+    assert len(docker.stream_arguments) == 1
+    assert not output.exists()
+    assert not list(tmp_path.glob(f".{output.name}.*.tmp"))
+
+
+def test_sequence_accepts_explicit_pointer_observation_failure(tmp_path):
+    class UnobservedPointerDocker(FakeDocker):
+        def exec_stream_json(self, container_id, arguments, destination, **kwargs):
+            payload = super().exec_stream_json(
+                container_id, arguments, destination, **kwargs
+            )
+            payload["results"][0]["pointer"] = None
+            payload["results"][0]["pointer_observation"] = {
+                "ok": False,
+                "error": {
+                    "code": "input_failed",
+                    "message": "pointer query failed",
+                    "details": {"reason": "transient"},
+                },
+            }
+            return payload
+
+    output = tmp_path / "unobserved-pointer.png"
+    payload = save_action_sequence_screenshot(
+        SessionExecutor(UnobservedPointerDocker(), SESSION),
+        output,
+        executor_arguments=[
+            "sequence",
+        ],
+        executor_input=b'[{"operation":"cursor.move","x":1,"y":2}]',
+        overwrite=False,
+    )
+
+    assert payload["completed"] is True
+    assert payload["actions_completed"] == 1
+    assert payload["results"][0]["pointer"] is None
+    assert output.read_bytes() == png()
+
+
+def test_sequence_rejects_unstructured_pointer_observation_failure(tmp_path):
+    class InvalidPointerDocker(FakeDocker):
+        def exec_stream_json(self, container_id, arguments, destination, **kwargs):
+            payload = super().exec_stream_json(
+                container_id, arguments, destination, **kwargs
+            )
+            payload["results"][0]["pointer"] = None
+            payload["results"][0]["pointer_observation"] = {"ok": True}
+            return payload
+
+    output = tmp_path / "invalid-pointer.png"
+    with pytest.raises(SagasuError) as error:
+        save_action_sequence_screenshot(
+            SessionExecutor(InvalidPointerDocker(), SESSION),
+            output,
+            executor_arguments=[
+                "sequence",
+            ],
+            executor_input=b'[{"operation":"cursor.move","x":1,"y":2}]',
+            overwrite=False,
+        )
+
+    assert error.value.code == "invalid_response"
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("partial_failure", [False, True])
+def test_sequence_observation_failure_state_is_validated_and_preserved(
+    tmp_path, partial_failure
+):
+    state = observation_failure_state(partial_failure=partial_failure)
+
+    class ObservationFailureDocker(FakeDocker):
+        def exec_stream_json(
+            self, container_id, arguments, destination, **kwargs
+        ):
+            del container_id, arguments, kwargs
+            destination.write(b"incomplete screenshot")
+            raise SagasuError(
+                "capture_failed",
+                "the final screenshot failed",
+                {"reason": "scrot exited", "sequence_state": state},
+                exit_status=7,
+            )
+
+    output = tmp_path / "failed-observation.png"
+    with pytest.raises(SagasuError) as error:
+        save_action_sequence_screenshot(
+            SessionExecutor(ObservationFailureDocker(), SESSION),
+            output,
+            executor_arguments=["sequence"],
+            executor_input=(
+                b'[{"operation":"cursor.move","x":1,"y":2},'
+                b'{"operation":"cursor.move","x":3,"y":4}]'
+            ),
+            overwrite=False,
+        )
+
+    assert error.value.code == "capture_failed"
+    assert error.value.exit_status == 7
+    assert error.value.details["reason"] == "scrot exited"
+    assert error.value.details["sequence_state"] == state
+    assert error.value.details["session_id"] == SESSION.session_id
+    assert error.value.details["container_id"] == SESSION.container_id
+    assert not output.exists()
+
+
+def test_sequence_observation_failure_rejects_invalid_action_state(tmp_path):
+    state = observation_failure_state()
+    state["actions_completed"] = 1
+
+    class InvalidObservationFailureDocker(FakeDocker):
+        def exec_stream_json(
+            self, container_id, arguments, destination, **kwargs
+        ):
+            del container_id, arguments, destination, kwargs
+            raise SagasuError(
+                "capture_failed",
+                "the final screenshot failed",
+                {"sequence_state": state},
+            )
+
+    output = tmp_path / "invalid-observation.png"
+    with pytest.raises(SagasuError) as error:
+        save_action_sequence_screenshot(
+            SessionExecutor(InvalidObservationFailureDocker(), SESSION),
+            output,
+            executor_arguments=["sequence"],
+            executor_input=b"[]",
+            overwrite=False,
+        )
+
+    assert error.value.code == "invalid_response"
+    assert not output.exists()
 
 
 def test_failed_sequence_keeps_diagnostic_screenshot(tmp_path):
@@ -203,6 +558,7 @@ def test_failed_sequence_keeps_diagnostic_screenshot(tmp_path):
                         "code": "input_failed",
                         "message": "the movement failed",
                         "details": {"backend": "humancursor"},
+                        "exit_status": 2,
                     },
                 }
             )
@@ -211,18 +567,19 @@ def test_failed_sequence_keeps_diagnostic_screenshot(tmp_path):
     output = tmp_path / "failed-sequence.png"
     arguments = [
         "sequence",
-        "--actions-json",
-        '[{"operation":"cursor.move","x":1,"y":2}]',
     ]
+    input_data = b'[{"operation":"cursor.move","x":1,"y":2}]'
     with pytest.raises(SagasuError) as error:
         save_action_sequence_screenshot(
             SessionExecutor(FailedSequenceDocker(), SESSION),
             output,
             executor_arguments=arguments,
+            executor_input=input_data,
             overwrite=False,
         )
 
     assert error.value.code == "input_failed"
+    assert error.value.exit_status == 2
     assert error.value.details == {
         "backend": "humancursor",
         "output": str(output),
@@ -245,14 +602,14 @@ def test_invalid_sequence_metadata_leaves_no_destination(tmp_path):
     output = tmp_path / "invalid-sequence.png"
     arguments = [
         "sequence",
-        "--actions-json",
-        '[{"operation":"cursor.move","x":1,"y":2}]',
     ]
+    input_data = b'[{"operation":"cursor.move","x":1,"y":2}]'
     with pytest.raises(SagasuError) as error:
         save_action_sequence_screenshot(
             SessionExecutor(InvalidSequenceDocker(), SESSION),
             output,
             executor_arguments=arguments,
+            executor_input=input_data,
             overwrite=False,
         )
 

@@ -83,7 +83,18 @@ class DockerCLI:
             )
 
         containers: list[ContainerSummary] = []
-        output = completed.stdout.decode("utf-8", errors="strict")
+        try:
+            output = completed.stdout.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise SagasuError(
+                "invalid_response",
+                "Docker returned a container listing that is not valid UTF-8",
+                {
+                    "encoding": "utf-8",
+                    "byte_offset": exc.start,
+                    "reason": exc.reason,
+                },
+            ) from exc
         for line_number, line in enumerate(output.splitlines(), start=1):
             if not line.strip():
                 continue
@@ -153,17 +164,25 @@ class DockerCLI:
         return item
 
     @staticmethod
-    def _exec_arguments(container_id: str, arguments: Sequence[str]) -> list[str]:
-        # Deliberately omit -i and -t. In particular, a TTY corrupts raw PNG
-        # bytes on Docker implementations that perform terminal translation.
-        return [
+    def _exec_arguments(
+        container_id: str,
+        arguments: Sequence[str],
+        *,
+        attach_stdin: bool = False,
+    ) -> list[str]:
+        # Deliberately omit -t: a TTY corrupts raw PNG bytes on Docker
+        # implementations that perform terminal translation. Only the action
+        # sequence protocol attaches stdin; standalone commands remain fully
+        # detached.
+        command = [
             "exec",
             "--user",
             "sagasu",
-            container_id,
-            SESSION_EXECUTOR,
-            *arguments,
         ]
+        if attach_stdin:
+            command.append("--interactive")
+        command.extend([container_id, SESSION_EXECUTOR, *arguments])
+        return command
 
     def exec_json(
         self, container_id: str, arguments: Sequence[str]
@@ -208,6 +227,7 @@ class DockerCLI:
         arguments: Sequence[str],
         destination: BinaryIO,
         *,
+        input_data: bytes | None = None,
         failure_code: str = "dom_failed",
         failure_message: str = "The in-container DOM command failed",
     ) -> dict[str, Any]:
@@ -217,6 +237,7 @@ class DockerCLI:
             container_id,
             arguments,
             destination,
+            input_data=input_data,
             failure_code=failure_code,
             failure_message=failure_message,
         )
@@ -234,18 +255,32 @@ class DockerCLI:
         arguments: Sequence[str],
         destination: BinaryIO,
         *,
+        input_data: bytes | None = None,
         failure_code: str,
         failure_message: str,
     ) -> bytes:
-        command = self._command(*self._exec_arguments(container_id, arguments))
+        command = self._command(
+            *self._exec_arguments(
+                container_id,
+                arguments,
+                attach_stdin=input_data is not None,
+            )
+        )
         try:
             process = self._popen(
                 command,
-                stdin=subprocess.DEVNULL,
+                stdin=(
+                    subprocess.PIPE
+                    if input_data is not None
+                    else subprocess.DEVNULL
+                ),
                 stdout=destination,
                 stderr=subprocess.PIPE,
             )
-            _, stderr = process.communicate()
+            if input_data is None:
+                _, stderr = process.communicate()
+            else:
+                _, stderr = process.communicate(input=input_data)
         except FileNotFoundError as exc:
             raise SagasuError(
                 "docker_unavailable",

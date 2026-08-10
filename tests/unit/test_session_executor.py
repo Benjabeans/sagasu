@@ -102,15 +102,12 @@ def test_xdotool_must_be_selected_explicitly(monkeypatch, tmp_path):
     assert payload["backend"] == "xdotool"
 
 
-def test_out_of_bounds_is_rejected_before_loading_backend(
+def test_out_of_bounds_is_rejected_before_using_prepared_backend(
     monkeypatch, tmp_path
 ):
     install_fake_display(monkeypatch)
-    monkeypatch.setattr(
-        cli,
-        "create_backend",
-        lambda name: pytest.fail("backend should not be loaded"),
-    )
+    backend = FakeBackend()
+    monkeypatch.setattr(cli, "create_backend", lambda name: backend)
     arguments = cli.build_parser().parse_args(["cursor", "move", "100", "2"])
     with pytest.raises(SagasuError) as error:
         cli.execute(
@@ -120,6 +117,34 @@ def test_out_of_bounds_is_rejected_before_loading_backend(
             pause_path=tmp_path / "paused",
         )
     assert error.value.code == "invalid_coordinate"
+    assert backend.calls == []
+
+
+def test_pause_starting_during_backend_setup_blocks_cursor_action(
+    monkeypatch, tmp_path
+):
+    install_fake_display(monkeypatch)
+    paused = tmp_path / "paused"
+    backend = FakeBackend()
+
+    def backend_factory(name):
+        del name
+        paused.write_text("paused\n")
+        return backend
+
+    monkeypatch.setattr(cli, "create_backend", backend_factory)
+    arguments = cli.build_parser().parse_args(["cursor", "move", "20", "30"])
+
+    with pytest.raises(SagasuError) as error:
+        cli.execute(
+            arguments,
+            text_stdout=io.StringIO(),
+            lock_path=tmp_path / "control.lock",
+            pause_path=paused,
+        )
+
+    assert error.value.code == "human_control"
+    assert backend.calls == []
 
 
 def test_pause_blocks_mutation_but_not_observation(monkeypatch, tmp_path):
@@ -299,6 +324,7 @@ def test_sequence_holds_one_lock_through_delay_and_screenshot(
     install_fake_display(monkeypatch)
     locked = False
     events = []
+    backend = FakeBackend()
 
     @contextmanager
     def tracking_lock(*, exclusive, path):
@@ -314,8 +340,14 @@ def test_sequence_holds_one_lock_through_delay_and_screenshot(
             events.append("lock.exit")
             locked = False
 
-    def run(actions, display):
+    def create_backend(name):
+        assert locked is False
+        events.append(("backend.create", name))
+        return backend
+
+    def run(actions, display, *, backend_factory):
         assert locked is True
+        assert backend_factory("humancursor") is backend
         events.append(("run", len(actions), display))
         return SequenceExecution(
             (
@@ -340,20 +372,20 @@ def test_sequence_holds_one_lock_through_delay_and_screenshot(
         destination.write(b"PNG")
 
     monkeypatch.setattr(cli, "session_lock", tracking_lock)
+    monkeypatch.setattr(cli, "create_backend", create_backend)
     monkeypatch.setattr(cli, "run_action_sequence", run)
     monkeypatch.setattr(cli, "stream_png", capture)
     binary = io.BytesIO()
     metadata = io.StringIO()
     arguments = cli.build_parser().parse_args(
-        [
-            "sequence",
-            "--actions-json",
-            '[{"operation":"cursor.move","x":20,"y":30}]',
-        ]
+        ["sequence"]
     )
 
     cli.execute(
         arguments,
+        binary_stdin=io.BytesIO(
+            b'[{"operation":"cursor.move","x":20,"y":30}]'
+        ),
         binary_stdout=binary,
         metadata_stream=metadata,
         lock_path=tmp_path / "control.lock",
@@ -364,6 +396,7 @@ def test_sequence_holds_one_lock_through_delay_and_screenshot(
 
     assert binary.getvalue() == b"PNG"
     assert events == [
+        ("backend.create", "humancursor"),
         "lock.enter",
         ("run", 1, DisplaySize(100, 80)),
         ("sleep", 1.0),
@@ -387,8 +420,9 @@ def test_failed_sequence_still_waits_and_captures(monkeypatch, tmp_path):
     monkeypatch.setattr(
         cli,
         "run_action_sequence",
-        lambda actions, display: SequenceExecution((), failure, 0),
+        lambda actions, display, **kwargs: SequenceExecution((), failure, 0),
     )
+    monkeypatch.setattr(cli, "create_backend", lambda name: FakeBackend())
     monkeypatch.setattr(
         cli,
         "stream_png",
@@ -402,8 +436,6 @@ def test_failed_sequence_still_waits_and_captures(monkeypatch, tmp_path):
     arguments = cli.build_parser().parse_args(
         [
             "sequence",
-            "--actions-json",
-            '[{"operation":"cursor.click","x":20,"y":30}]',
             "--settle-ms",
             "250",
             "--no-pointer",
@@ -412,6 +444,9 @@ def test_failed_sequence_still_waits_and_captures(monkeypatch, tmp_path):
 
     cli.execute(
         arguments,
+        binary_stdin=io.BytesIO(
+            b'[{"operation":"cursor.click","x":20,"y":30}]'
+        ),
         binary_stdout=binary,
         metadata_stream=metadata,
         lock_path=tmp_path / "control.lock",
@@ -433,6 +468,107 @@ def test_failed_sequence_still_waits_and_captures(monkeypatch, tmp_path):
     }
 
 
+@pytest.mark.parametrize("stage", ["screenshot", "pointer"])
+@pytest.mark.parametrize("partial_failure", [False, True])
+def test_final_observation_failure_preserves_authoritative_sequence_state(
+    monkeypatch, tmp_path, stage, partial_failure
+):
+    install_fake_display(monkeypatch)
+    successful_results = tuple(
+        {
+            "ok": True,
+            "index": index,
+            "operation": "cursor.move",
+            "backend": "humancursor",
+            "display": {"width": 100, "height": 80},
+            "pointer": {"x": 12, "y": 13},
+        }
+        for index in range(1 if partial_failure else 2)
+    )
+    action_failure = SagasuError(
+        "input_failed",
+        "the second movement failed",
+        {"backend": "humancursor"},
+    )
+    execution = SequenceExecution(
+        successful_results,
+        action_failure if partial_failure else None,
+        1 if partial_failure else None,
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_action_sequence",
+        lambda actions, display, **kwargs: execution,
+    )
+    monkeypatch.setattr(cli, "create_backend", lambda name: FakeBackend())
+
+    observation_error = SagasuError(
+        "capture_failed" if stage == "screenshot" else "input_failed",
+        f"final {stage} observation failed",
+        {"reason": "transient"},
+    )
+
+    def capture(destination, *, include_pointer):
+        del include_pointer
+        destination.write(b"partial" if stage == "screenshot" else b"PNG")
+        if stage == "screenshot":
+            raise observation_error
+
+    def pointer_position():
+        if stage == "pointer":
+            raise observation_error
+        pytest.fail("the final pointer query must not follow a failed screenshot")
+
+    monkeypatch.setattr(cli, "stream_png", capture)
+    monkeypatch.setattr(cli, "get_pointer_position", pointer_position)
+    binary = io.BytesIO()
+    metadata = io.StringIO()
+    arguments = cli.build_parser().parse_args(
+        ["sequence", "--settle-ms", "25", "--no-pointer"]
+    )
+
+    with pytest.raises(SagasuError) as raised:
+        cli.execute(
+            arguments,
+            binary_stdin=io.BytesIO(
+                b'[{"operation":"cursor.move","x":20,"y":30},'
+                b'{"operation":"cursor.move","x":40,"y":50}]'
+            ),
+            binary_stdout=binary,
+            metadata_stream=metadata,
+            lock_path=tmp_path / "control.lock",
+            pause_path=tmp_path / "paused",
+            environ={},
+            sleep=lambda seconds: None,
+        )
+
+    assert raised.value.code == observation_error.code
+    assert raised.value.details["reason"] == "transient"
+    state = raised.value.details["sequence_state"]
+    assert state["completed"] is not partial_failure
+    assert state["action_count"] == 2
+    assert state["actions_completed"] == len(successful_results)
+    assert state["results"] == list(successful_results)
+    assert state["display"] == {"width": 100, "height": 80}
+    assert state["settle_ms"] == 25
+    assert state["settle_completed"] is True
+    assert state["pointer_included"] is False
+    assert state["screenshot_captured"] is (stage == "pointer")
+    assert state["pointer_observed"] is False
+    assert state["observation_stage"] == stage
+    if partial_failure:
+        assert state["failed_index"] == 1
+        assert state["failure"] == action_failure.as_dict()["error"]
+    else:
+        assert "failed_index" not in state
+        assert "failure" not in state
+    assert binary.getvalue() == (
+        b"partial" if stage == "screenshot" else b"PNG"
+    )
+    assert metadata.getvalue() == ""
+    assert raised.value.as_dict()["error"]["details"]["sequence_state"] == state
+
+
 def test_sequence_limit_is_container_enforced_before_actions(
     monkeypatch, tmp_path
 ):
@@ -446,13 +582,12 @@ def test_sequence_limit_is_container_enforced_before_actions(
         {"operation": "cursor.move", "x": index, "y": index}
         for index in range(4)
     ]
-    arguments = cli.build_parser().parse_args(
-        ["sequence", "--actions-json", json.dumps(actions)]
-    )
+    arguments = cli.build_parser().parse_args(["sequence"])
 
     with pytest.raises(SagasuError) as error:
         cli.execute(
             arguments,
+            binary_stdin=io.BytesIO(json.dumps(actions).encode()),
             binary_stdout=io.BytesIO(),
             metadata_stream=io.StringIO(),
             lock_path=tmp_path / "control.lock",
@@ -461,6 +596,56 @@ def test_sequence_limit_is_container_enforced_before_actions(
             sleep=lambda seconds: None,
         )
     assert error.value.code == "sequence_too_long"
+
+
+@pytest.mark.parametrize("input_data", (b"", b"{"))
+def test_missing_or_malformed_sequence_stdin_is_structured(
+    monkeypatch, capsys, input_data
+):
+    @contextmanager
+    def no_activity(**kwargs):
+        del kwargs
+        yield
+
+    monkeypatch.setattr(cli, "agent_activity", no_activity)
+
+    status = cli.main(
+        ["sequence"],
+        binary_stdin=io.BytesIO(input_data),
+    )
+
+    captured = capsys.readouterr()
+    assert status == 2
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "invalid_arguments"
+    assert payload["error"]["exit_status"] == 2
+
+
+def test_sequence_stdin_is_bounded_and_structured(monkeypatch, capsys):
+    @contextmanager
+    def no_activity(**kwargs):
+        del kwargs
+        yield
+
+    monkeypatch.setattr(cli, "agent_activity", no_activity)
+    monkeypatch.setattr(cli, "MAX_SEQUENCE_INPUT_BYTES", 8)
+    monkeypatch.setattr(cli, "SEQUENCE_INPUT_CHUNK_BYTES", 3)
+
+    status = cli.main(
+        ["sequence"],
+        binary_stdin=io.BytesIO(b"123456789"),
+    )
+
+    captured = capsys.readouterr()
+    assert status == 2
+    payload = json.loads(captured.err)
+    assert payload["error"]["code"] == "invalid_arguments"
+    assert payload["error"]["details"] == {
+        "bytes_at_least": 9,
+        "max_bytes": 8,
+    }
 
 
 def test_human_pause_blocks_sequence_before_actions(monkeypatch, tmp_path):
@@ -472,17 +657,14 @@ def test_human_pause_blocks_sequence_before_actions(monkeypatch, tmp_path):
         "run_action_sequence",
         lambda actions, display: pytest.fail("actions must not run"),
     )
-    arguments = cli.build_parser().parse_args(
-        [
-            "sequence",
-            "--actions-json",
-            '[{"operation":"cursor.move","x":20,"y":30}]',
-        ]
-    )
+    arguments = cli.build_parser().parse_args(["sequence"])
 
     with pytest.raises(SagasuError) as error:
         cli.execute(
             arguments,
+            binary_stdin=io.BytesIO(
+                b'[{"operation":"cursor.move","x":20,"y":30}]'
+            ),
             binary_stdout=io.BytesIO(),
             metadata_stream=io.StringIO(),
             lock_path=tmp_path / "control.lock",

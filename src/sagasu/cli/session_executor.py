@@ -24,7 +24,9 @@ from sagasu.cdp.locate import ElementLocation, locate_active_element
 from sagasu.cdp.navigate import navigate_active_page
 from sagasu.cli.action_sequence import (
     ActionSequenceConfig,
+    SequenceExecution,
     parse_action_sequence,
+    prepare_cursor_backends,
     run_action_sequence,
     validate_sequence_coordinates,
 )
@@ -41,6 +43,13 @@ from sagasu.xcontrol.display import (
     get_pointer_position,
     validate_coordinate,
 )
+
+
+# The largest validator-accepted sequence (100 maximum-sized text inserts,
+# including worst-case JSON escaping) is under 40 MiB. Keep the private stdin
+# protocol finite while leaving headroom for its object fields.
+MAX_SEQUENCE_INPUT_BYTES = 64 * 1024 * 1024
+SEQUENCE_INPUT_CHUNK_BYTES = 64 * 1024
 
 
 class ProtocolArgumentParser(argparse.ArgumentParser):
@@ -98,7 +107,6 @@ def build_parser() -> argparse.ArgumentParser:
         "sequence",
         help="apply bounded input actions and stream a final screenshot",
     )
-    sequence.add_argument("--actions-json", required=True)
     sequence.add_argument("--settle-ms", type=int)
     sequence.add_argument("--no-pointer", action="store_true")
 
@@ -224,6 +232,7 @@ def _result(
 def execute(
     arguments: argparse.Namespace,
     *,
+    binary_stdin: BinaryIO | None = None,
     text_stdout: TextIO | None = None,
     binary_stdout: BinaryIO | None = None,
     metadata_stream: TextIO | None = None,
@@ -241,6 +250,7 @@ def execute(
     ):
         _execute_command(
             arguments,
+            binary_stdin=binary_stdin,
             text_stdout=text_stdout,
             binary_stdout=binary_stdout,
             metadata_stream=metadata_stream,
@@ -254,6 +264,7 @@ def execute(
 def _execute_command(
     arguments: argparse.Namespace,
     *,
+    binary_stdin: BinaryIO | None,
     text_stdout: TextIO | None,
     binary_stdout: BinaryIO | None,
     metadata_stream: TextIO | None,
@@ -269,10 +280,13 @@ def _execute_command(
     if metadata_stream is None:
         metadata_stream = cast(TextIO, sys.stderr)
     if arguments.command == "sequence":
+        if binary_stdin is None:
+            binary_stdin = cast(BinaryIO, sys.stdin.buffer)
         if binary_stdout is None:
             binary_stdout = cast(BinaryIO, sys.stdout.buffer)
         _execute_sequence(
             arguments,
+            binary_stdin=binary_stdin,
             binary_stdout=binary_stdout,
             metadata_stream=metadata_stream,
             lock_path=lock_path,
@@ -386,6 +400,7 @@ def _execute_command(
 def _execute_sequence(
     arguments: argparse.Namespace,
     *,
+    binary_stdin: BinaryIO,
     binary_stdout: BinaryIO,
     metadata_stream: TextIO,
     lock_path: Path | str,
@@ -395,23 +410,55 @@ def _execute_sequence(
 ) -> None:
     config = ActionSequenceConfig.from_environ(environ)
     actions = parse_action_sequence(
-        arguments.actions_json,
+        _read_sequence_input(binary_stdin),
         max_actions=config.max_actions,
     )
     settle_ms = config.effective_settle_ms(arguments.settle_ms)
+
+    human_control.require_agent_control(pause_path)
+    backends = prepare_cursor_backends(
+        actions,
+        backend_factory=create_backend,
+    )
 
     with session_lock(exclusive=True, path=lock_path):
         human_control.require_agent_control(pause_path)
         display = get_display_size()
         validate_sequence_coordinates(actions, display)
-        execution = run_action_sequence(actions, display)
+        execution = run_action_sequence(
+            actions,
+            display,
+            backend_factory=backends.__getitem__,
+        )
         if settle_ms:
             sleep(settle_ms / 1000)
-        stream_png(
-            binary_stdout,
-            include_pointer=not arguments.no_pointer,
-        )
-        pointer = get_pointer_position()
+        try:
+            stream_png(
+                binary_stdout,
+                include_pointer=not arguments.no_pointer,
+            )
+        except SagasuError as error:
+            _raise_sequence_observation_failure(
+                error,
+                execution=execution,
+                action_count=len(actions),
+                display=display,
+                settle_ms=settle_ms,
+                pointer_included=not arguments.no_pointer,
+                stage="screenshot",
+            )
+        try:
+            pointer = get_pointer_position()
+        except SagasuError as error:
+            _raise_sequence_observation_failure(
+                error,
+                execution=execution,
+                action_count=len(actions),
+                display=display,
+                settle_ms=settle_ms,
+                pointer_included=not arguments.no_pointer,
+                stage="pointer",
+            )
 
     extra: dict[str, object] = {
         "completed": execution.completed,
@@ -434,6 +481,96 @@ def _execute_sequence(
         ),
         metadata_stream,
     )
+
+
+def _raise_sequence_observation_failure(
+    error: SagasuError,
+    *,
+    execution: SequenceExecution,
+    action_count: int,
+    display: DisplaySize,
+    settle_ms: int,
+    pointer_included: bool,
+    stage: str,
+) -> NoReturn:
+    """Preserve authoritative mutation state when final observation fails."""
+
+    state: dict[str, object] = {
+        "completed": execution.completed,
+        "action_count": action_count,
+        "actions_completed": len(execution.results),
+        "display": {"width": display.width, "height": display.height},
+        "results": list(execution.results),
+        "settle_ms": settle_ms,
+        "settle_completed": True,
+        "pointer_included": pointer_included,
+        "screenshot_captured": stage == "pointer",
+        "pointer_observed": False,
+        "observation_stage": stage,
+    }
+    if execution.failure is not None:
+        state["failed_index"] = execution.failed_index
+        state["failure"] = execution.failure.as_dict()["error"]
+
+    details = dict(error.details)
+    details["sequence_state"] = state
+    raise SagasuError(
+        error.code,
+        error.message,
+        details,
+        exit_status=error.exit_status,
+    ) from error
+
+
+def _read_sequence_input(stream: BinaryIO) -> str:
+    """Read one EOF-delimited, bounded UTF-8 action document from stdin."""
+
+    chunks: list[bytes] = []
+    remaining = MAX_SEQUENCE_INPUT_BYTES + 1
+    try:
+        while remaining:
+            chunk = stream.read(min(SEQUENCE_INPUT_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except OSError as exc:
+        raise SagasuError(
+            "invalid_arguments",
+            "The action sequence could not be read from stdin",
+            {"reason": str(exc)},
+            exit_status=2,
+        ) from exc
+
+    data = b"".join(chunks)
+    if not data:
+        raise SagasuError(
+            "invalid_arguments",
+            "The action sequence is required on stdin",
+            exit_status=2,
+        )
+    if len(data) > MAX_SEQUENCE_INPUT_BYTES:
+        raise SagasuError(
+            "invalid_arguments",
+            "The action sequence supplied on stdin is too large",
+            {
+                "bytes_at_least": len(data),
+                "max_bytes": MAX_SEQUENCE_INPUT_BYTES,
+            },
+            exit_status=2,
+        )
+    try:
+        return data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise SagasuError(
+            "invalid_arguments",
+            "The action sequence supplied on stdin is not valid UTF-8",
+            {
+                "byte_offset": exc.start,
+                "reason": exc.reason,
+            },
+            exit_status=2,
+        ) from exc
 
 
 def _execute_cdp_mutation(
@@ -553,6 +690,13 @@ def _execute_mutation(
                 exit_status=2,
             )
 
+    # Backend construction can import PIL/python-xlib and connect to X.  Keep
+    # that setup out of the exclusive display critical section, but retain an
+    # authoritative pause check under the lock in case human control begins
+    # while the backend is being prepared.
+    human_control.require_agent_control(pause_path)
+    backend = create_backend(arguments.backend)
+
     with session_lock(exclusive=True, path=lock_path):
         human_control.require_agent_control(pause_path)
         display = get_display_size()
@@ -564,7 +708,6 @@ def _execute_mutation(
 
         if command == "move":
             validate_coordinate(arguments.x, arguments.y, display)
-            backend = create_backend(arguments.backend)
             backend.move(
                 arguments.x,
                 arguments.y,
@@ -581,7 +724,6 @@ def _execute_mutation(
                 action="click",
             )
             validate_coordinate(x, y, display)
-            backend = create_backend(arguments.backend)
             backend.click(
                 x,
                 y,
@@ -599,7 +741,6 @@ def _execute_mutation(
             )
             validate_coordinate(x1, y1, display, name="start coordinate")
             validate_coordinate(x2, y2, display, name="end coordinate")
-            backend = create_backend(arguments.backend)
             backend.drag(
                 x1,
                 y1,
@@ -618,7 +759,6 @@ def _execute_mutation(
                 action="scroll",
             )
             validate_coordinate(x, y, display)
-            backend = create_backend(arguments.backend)
             backend.scroll(x, y, steps=arguments.steps)
             operation = "cursor.scroll"
 
@@ -685,10 +825,14 @@ def _drag_points(
     )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    binary_stdin: BinaryIO | None = None,
+) -> int:
     try:
         arguments = build_parser().parse_args(argv)
-        execute(arguments)
+        execute(arguments, binary_stdin=binary_stdin)
         return 0
     except SagasuError as error:
         write_json(error.as_dict(), sys.stderr)

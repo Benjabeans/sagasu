@@ -26,9 +26,13 @@ from sagasu.sessions.resolver import resolve_session
 
 def run(arguments: argparse.Namespace, docker: DockerCLI) -> dict[str, Any]:
     runtime_arguments: list[str] | None = None
+    sequence_input: bytes | None = None
     if arguments.session_command not in ("screenshot", "dom"):
         # Validate the complete action shape before contacting Docker.
-        runtime_arguments = _runtime_arguments(arguments)
+        if arguments.session_command == "sequence":
+            runtime_arguments, sequence_input = _sequence_invocation(arguments)
+        else:
+            runtime_arguments = _runtime_arguments(arguments)
     resolved = resolve_session(
         docker,
         session_id=arguments.session_target,
@@ -50,10 +54,12 @@ def run(arguments: argparse.Namespace, docker: DockerCLI) -> dict[str, Any]:
         )
     assert runtime_arguments is not None
     if arguments.session_command == "sequence":
+        assert sequence_input is not None
         return save_action_sequence_screenshot(
             executor,
             arguments.out,
             executor_arguments=runtime_arguments,
+            executor_input=sequence_input,
             overwrite=arguments.overwrite,
         )
     return executor.invoke(runtime_arguments)
@@ -73,19 +79,7 @@ def _runtime_arguments(arguments: argparse.Namespace) -> list[str]:
         validate_insert_text(arguments.text)
         return ["insert-text", "--", arguments.text]
     if command == "sequence":
-        actions = parse_action_sequence(arguments.actions_json)
-        runtime = [
-            "sequence",
-            "--actions-json",
-            encode_action_sequence(actions),
-        ]
-        if arguments.settle_ms is not None:
-            runtime.extend(
-                ["--settle-ms", str(validate_settle_ms(arguments.settle_ms))]
-            )
-        if arguments.no_pointer:
-            runtime.append("--no-pointer")
-        return runtime
+        return _sequence_invocation(arguments)[0]
     if command != "cursor":  # pragma: no cover - parser constrains this
         raise SagasuError(
             "invalid_arguments",
@@ -168,6 +162,23 @@ def _runtime_arguments(arguments: argparse.Namespace) -> list[str]:
             ]
         )
     return runtime
+
+
+def _sequence_invocation(
+    arguments: argparse.Namespace,
+) -> tuple[list[str], bytes]:
+    """Build sequence argv and its separately transported stdin document."""
+
+    actions = parse_action_sequence(arguments.actions_json)
+    runtime = ["sequence"]
+    if arguments.settle_ms is not None:
+        runtime.extend(
+            ["--settle-ms", str(validate_settle_ms(arguments.settle_ms))]
+        )
+    if arguments.no_pointer:
+        runtime.append("--no-pointer")
+    document = encode_action_sequence(actions).encode("utf-8")
+    return runtime, document
 
 
 def _validate_action_coordinates(

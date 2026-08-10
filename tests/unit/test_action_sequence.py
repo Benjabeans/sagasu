@@ -5,12 +5,14 @@ import json
 import pytest
 
 from sagasu.cdp.insert_text import TextInsertionResult
+from sagasu.cdp.navigate import NavigationResult
 from sagasu.cli.action_sequence import (
     ActionSequenceConfig,
     CursorClick,
     PageNavigate,
     encode_action_sequence,
     parse_action_sequence,
+    prepare_cursor_backends,
     run_action_sequence,
     validate_sequence_coordinates,
 )
@@ -127,6 +129,24 @@ def test_parser_rejects_unqueueable_or_invalid_actions(actions, code):
     assert error.value.code == code
 
 
+@pytest.mark.parametrize(
+    "actions_json",
+    [
+        r'[{"operation":"text.insert","text":"\ud800"}]',
+        (
+            r'[{"operation":"page.navigate",'
+            r'"url":"https://example.test/\udfff"}]'
+        ),
+    ],
+)
+def test_parser_rejects_lone_unicode_surrogates(actions_json):
+    with pytest.raises(SagasuError) as error:
+        parse_action_sequence(actions_json)
+
+    assert error.value.code == "invalid_arguments"
+    assert error.value.exit_status == 2
+
+
 def test_navigation_must_be_final():
     with pytest.raises(SagasuError) as error:
         parse_action_sequence(
@@ -157,6 +177,36 @@ def test_all_coordinates_are_checked_before_execution():
         validate_sequence_coordinates(actions, DisplaySize(100, 80))
     assert error.value.code == "invalid_coordinate"
     assert error.value.message.startswith("action 1 coordinate")
+
+
+def test_cursor_backends_are_prepared_once_in_first_use_order():
+    actions = parse_action_sequence(
+        document(
+            {"operation": "cursor.move", "x": 1, "y": 2},
+            {"operation": "text.insert", "text": "apples"},
+            {
+                "operation": "cursor.scroll",
+                "x": 3,
+                "y": 4,
+                "steps": -1,
+                "backend": "xdotool",
+            },
+            {"operation": "cursor.click", "x": 5, "y": 6},
+        )
+    )
+    created = []
+
+    def backend_factory(name):
+        created.append(name)
+        return FakeBackend([])
+
+    backends = prepare_cursor_backends(
+        actions,
+        backend_factory=backend_factory,
+    )
+
+    assert list(backends) == ["humancursor", "xdotool"]
+    assert created == ["humancursor", "xdotool"]
 
 
 def test_mixed_sequence_runs_in_order_and_reuses_cursor_backend():
@@ -205,6 +255,94 @@ def test_mixed_sequence_runs_in_order_and_reuses_cursor_backend():
         "cursor.scroll",
     ]
     assert "text" not in outcome.results[1]
+
+
+def test_pointer_observation_failures_do_not_fail_applied_mutations():
+    actions = parse_action_sequence(
+        document(
+            {"operation": "cursor.move", "x": 1, "y": 2},
+            {"operation": "cursor.click", "x": 3, "y": 4},
+            {
+                "operation": "cursor.drag",
+                "x1": 5,
+                "y1": 6,
+                "x2": 7,
+                "y2": 8,
+            },
+            {"operation": "cursor.scroll", "x": 9, "y": 10, "steps": -1},
+            {"operation": "text.insert", "text": "apples"},
+            {"operation": "page.navigate", "url": "https://example.test/"},
+        )
+    )
+    events = []
+
+    def pointer_position():
+        events.append(("pointer",))
+        raise SagasuError(
+            "input_failed",
+            "pointer query failed",
+            {"reason": "transient"},
+        )
+
+    def insert_text(text):
+        events.append(("insert", text))
+        return TextInsertionResult(
+            target_id="target-1",
+            title="Search",
+            url="https://example.test/",
+            character_count=len(text),
+            byte_count=len(text.encode()),
+        )
+
+    def navigate(url):
+        events.append(("navigate", url))
+        return NavigationResult(
+            target_id="target-1",
+            requested_url=url,
+            frame_id="frame-1",
+            loader_id="loader-1",
+            is_download=False,
+        )
+
+    outcome = run_action_sequence(
+        actions,
+        DisplaySize(100, 80),
+        backend_factory=lambda name: FakeBackend(events),
+        pointer_position=pointer_position,
+        insert_text=insert_text,
+        navigate=navigate,
+    )
+
+    assert outcome.completed is True
+    assert outcome.failure is None
+    assert [event[0] for event in events] == [
+        "move",
+        "pointer",
+        "click",
+        "pointer",
+        "drag",
+        "pointer",
+        "scroll",
+        "pointer",
+        "insert",
+        "pointer",
+        "navigate",
+        "pointer",
+    ]
+    assert [result["index"] for result in outcome.results] == list(range(6))
+    assert all(result["pointer"] is None for result in outcome.results)
+    assert all(
+        result["pointer_observation"]
+        == {
+            "ok": False,
+            "error": {
+                "code": "input_failed",
+                "message": "pointer query failed",
+                "details": {"reason": "transient"},
+            },
+        }
+        for result in outcome.results
+    )
 
 
 def test_runtime_failure_stops_remaining_actions():

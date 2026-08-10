@@ -207,10 +207,15 @@ def _viewport_metrics(response: Mapping[str, object]) -> ViewportMetrics:
             "invalid_response",
             "CDP omitted the CSS visual viewport",
         )
+    zoom = (
+        _positive_number(raw, "zoom", "viewport zoom")
+        if "zoom" in raw
+        else 1.0
+    )
     return ViewportMetrics(
         width=_positive_number(raw, "clientWidth", "viewport width"),
         height=_positive_number(raw, "clientHeight", "viewport height"),
-        zoom=_positive_number(raw, "zoom", "viewport zoom"),
+        zoom=zoom,
     )
 
 

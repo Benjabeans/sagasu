@@ -95,6 +95,17 @@ def test_navigation_rejects_non_web_or_malformed_urls(url):
     assert error.value.exit_status == 2
 
 
+def test_navigation_rejects_lone_unicode_surrogates():
+    with pytest.raises(SagasuError) as error:
+        navigate.navigate_active_page(
+            "https://example.test/\udfff",
+            client=object(),
+        )
+
+    assert error.value.code == "invalid_arguments"
+    assert error.value.exit_status == 2
+
+
 def test_navigation_reports_browser_failure():
     client = FakeClient(
         {

@@ -68,3 +68,14 @@ def test_insert_text_rejects_empty_and_oversized_values(monkeypatch):
             client=object(),
         )
     assert oversized.value.code == "invalid_arguments"
+
+
+def test_insert_text_rejects_lone_unicode_surrogates():
+    with pytest.raises(SagasuError) as error:
+        insert_text.insert_text_active_page(
+            "\ud800",
+            client=object(),
+        )
+
+    assert error.value.code == "invalid_arguments"
+    assert error.value.exit_status == 2
