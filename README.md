@@ -1,166 +1,308 @@
 # Sagasu
 
-**Human-in-the-loop browser infrastructure for autonomous agents.**
+**Vision-first browser control inside persistent Docker sessions.**
 
-Sagasu gives headless agents a way to hand a live browser session to a human — for CAPTCHAs, logins, 2FA, or anything else an agent shouldn't (or can't) do itself — and then take the session back and keep working: a reproducible, multi-agent, multi-session system with a single place for humans to service requests.
+Sagasu runs a real, headful Chromium-family browser on a virtual X11 display.
+An agent sees the full display, including browser chrome and overlays, and
+drives its real X cursor through HumanCursor. CDP is a supplemental channel for
+structured operations: capture the current DOM, map a visible CSS element into
+screen coordinates, navigate directly to a URL, or insert Unicode text into an
+already focused field.
 
-Sagasu is an **X-input-first browser skill**. An agent's normal loop is to capture the full X11 display, reason over what is visibly on screen, and drive the real cursor and keyboard through the session's X server. CDP is a supplemental channel for operations that are more direct or reliable as browser commands — opening a URL, waiting for navigation, inspecting the DOM or accessibility tree, inserting Unicode text, attaching a file, and managing cookies. CDP and the DOM inform or shortcut the interaction; they are not the default clicking path.
+The current repository provides the browser image, a persistent preview
+session, the host-side session-control CLI, safe artifact handling, bounded
+multi-action sequences, idle cursor motion, and a basic manual human-control
+pause. It does **not** yet provide automated session creation, a handoff queue,
+or the centralized human panel described in the longer-term design.
+
+## Current status
+
+| Implemented now | Planned, not implemented |
+| --- | --- |
+| Helium or Chromium in Xvnc/Openbox | `sagasu setup` and `sagasu config` |
+| Persistent browser profile volume | `sagasu session start/stop` lifecycle |
+| Full-display screenshots | Centralized intervention queue and panel |
+| HumanCursor X-level mouse control | Public handoff request/status commands |
+| `xdotool` cursor fallback | General X keyboard press/type commands |
+| CDP DOM, locate, navigate, and focused text insertion | CDP lifecycle waits, uploads, cookies, and accessibility tools |
+| Up to three queued mutations plus an automatic screenshot | MCP server or inline image responses |
+| Continuous idle cursor animation | Shared-login, multi-window session mode |
+| Private pause/resume for manual handoff | Automatic human-resume signaling |
+
+The implemented public CLI commands are:
+
+```text
+sagasu session display
+sagasu session screenshot
+sagasu session dom
+sagasu session locate
+sagasu session navigate
+sagasu session insert-text
+sagasu session sequence
+sagasu session cursor position|move|click|drag|scroll
+```
 
 ## The problem
 
-Agents doing real work on the web constantly hit walls that require a human: CAPTCHA challenges, SSO logins, 2FA prompts, consent screens. And the ways agents browse the web today — including the existing human-handoff tools — have structural problems:
+Browser agents need a controlled environment that does not take over the
+operator's desktop, can keep authenticated state between tasks, and can be
+handed to a person when a login or CAPTCHA appears. A browser container gives
+each session its own screen, cursor, process tree, and profile. The same X11
+display can be viewed through noVNC, so a person and an agent can work in the
+same browser rather than moving cookies or recreating the challenge elsewhere.
 
-- **Computer use takes over your device.** Computer-use and active browser-use agents drive *your* screen, keyboard, and browser. While the agent works, the machine is effectively unusable — and since there is one desktop and one cursor, parallelism and multi-agent sessions are a non-starter.
-- **The agent can't raise its hand.** Existing handoff tools are watch-and-intervene: a human must already be looking at the screen to notice the agent is stuck. There is no primitive for the agent to signal "I'm blocked on a CAPTCHA at session X — come help."
-- **There's no resume signal either.** The mirror problem: after the human solves the challenge, nothing tells the agent it's done. Agents poll the DOM hoping the challenge iframe disappeared, or the human types "done" into a chat.
-- **Session sprawl instead of a fleet.** Every blocked session surfaces its own URL and password through its own channel. Three agents blocked on three CAPTCHAs means three links pasted into three chats, in no particular order, with nothing tracking what's pending or resolved.
-- **Ephemeral state.** Browser sessions live in throwaway profiles; every new task starts logged out, and the human re-authenticates to the same sites over and over.
-- **The CAPTCHA comes back.** Anti-bot systems challenge fresh, anonymous-looking sessions far more aggressively than established ones. A throwaway browser that gets a human solve and is then discarded re-triggers the same challenge on the next task — handoff degenerates into a CAPTCHA treadmill for the human. (When and why this happens: [Problems.md](./Problems.md).)
-- **Solvers hit a coverage ceiling.** Automated captcha-solving integrations work per-type: every supported family (reCAPTCHA, hCaptcha, GeeTest, …) is a dedicated integration that must be built and maintained, and everything outside the list is a dead end — custom in-house widgets, new captcha versions during the catch-up lag, regional systems beyond the big names (common on the Chinese web), and verification that isn't a captcha at all (SMS codes, WeChat/Alipay QR-code logins, confirm-on-your-phone). Some challenges also score *how* the answer is produced — GeeTest checks the mouse trajectory of the slider drag, so computing the right answer still fails the biometric. A human working inside the agent's own session covers all of it: anything a human can do in a browser, including scanning an on-screen QR code with their phone. Coverage is categorical, not a per-type list.
+Persistent profiles also reduce repeated login and challenge work. Cookies and
+trusted-device state remain in the profile volume when the container stops or
+is recreated. Profiles are sensitive account material and must be protected
+accordingly.
 
-Implementation challenges encountered while building this are tracked separately in [Problems.md](./Problems.md).
+Sagasu does not solve or bypass CAPTCHAs. The current handoff mechanism pauses
+agent mutations and lets a human work in the existing browser. Fleet-wide
+request tracking and automatic resume are roadmap work. Additional design and
+implementation considerations live in [Problems.md](./Problems.md).
 
-## The idea
+## Architecture
 
 ```mermaid
-flowchart TB
-    A1[Agent] --> D
-    A2[Agent] --> D
-    A3[Agent] --> D
-    D[Docker runtime<br/><i>reproducibility</i>] --> N
-    N[noVNC layer<br/><i>persistent browser profiles</i>] -- launches --> B1[Browser session]
-    N -- launches --> B2[Browser session]
-    N -- launches --> B3[Browser session]
-    B1 --> P
-    B2 --> P
-    B3 --> P
-    P[Centralized panel<br/><i>FIFO queue of human-intervention requests,<br/>filterable by type: captcha, login, other</i>]
-    H[Human] --> P
+flowchart LR
+    A[Agent or host process] --> C[Public sagasu CLI]
+    C -->|docker exec| E[Private session executor]
+    E --> X[Xvnc display]
+    E --> D[Loopback CDP]
+    X --> H[HumanCursor / xdotool]
+    X --> S[scrot screenshot]
+    X --> V[noVNC view]
+    B[Helium or Chromium] --> X
+    B --> D
+    B --> P[(Persistent /profile volume)]
+    I[Idle cursor daemon] --> X
+    U[Human, when noVNC is exposed locally] --> V
 ```
 
-Four layers, together answering those problems: browsers run in containers off to the side (your device stays yours, sessions scale horizontally), state persists in named profiles, and every human ask lands in one queue. Inside each browser session, both agent and human act on the same X11 display and cursor; the agent additionally has a private, loopback-only CDP side channel for structured browser operations.
+One container represents one browser session. Xvnc supplies both the X server
+and VNC server, Openbox manages the browser window, websockify/noVNC provides a
+human view, and a local `socat` relay exposes Chromium's loopback CDP socket to
+the private executor. The idle daemon is noncritical; the browser, X server,
+noVNC, and CDP relay are supervised as critical session components.
 
-### 1. Docker runtime — reproducibility
+## Interaction model
 
-The entire browser stack (TigerVNC's Xvnc — virtual display and VNC server in one process — window manager, browser, X-level screenshot/input tools, and websockify/noVNC) lives in a container image. Any host that can run Docker can run Sagasu identically — no host package installs, no leftover processes, no per-distro pitfalls. Spinning up a new browser session is a container-level operation with isolated displays, cursors, ports, and profile volumes, so concurrent sessions can't collide.
+Sagasu is deliberately asymmetric:
 
-The browser itself is a configuration choice, not a hardcoded dependency. The default is **[Helium](https://github.com/imput/helium)** — a lightweight, privacy-focused Chromium fork that keeps the image small — with stock Chromium (or any Chromium-family browser that exposes CDP) as an alternative.
+1. **See with the full X display.** Screenshots are the primary source of
+   truth because they include browser chrome, popups, overlays, and challenge
+   iframes that the top-level DOM may not reveal.
+2. **Point through the real X cursor.** HumanCursor is the default backend for
+   move, click, drag, and scroll. It moves the same cursor a human sees through
+   noVNC.
+3. **Use the DOM only when more detail is needed.** DOM extraction and CSS
+   location supplement vision; they are not fetched automatically after every
+   frame.
+4. **Use CDP for inherently structured operations.** The built-in CDP verbs are
+   direct navigation, DOM capture, CSS-element location, and Unicode insertion
+   into the focused field.
 
-### 2. noVNC layer — persistent browser profiles
+The project does not currently expose general X keyboard typing. For text
+entry, first establish focus with an X-level click and then call
+`session insert-text`. This is especially important for CJK text, which is not
+reliable through an X keyboard map.
 
-Browser sessions are launched against **named, persistent profiles** stored on volumes. When a human logs into a site once, that authenticated state (cookies, sessions) survives the container and is reusable by any agent on subsequent tasks. Log in to a service on Monday; agents keep working inside that session all week. Profiles are treated as sensitive material: they never leave the host's network boundary and are never baked into images.
+## Quick start
 
-### 3. Browser sessions — X input first, CDP second
+Requirements:
 
-Each agent request gets its own session container: a real X11 desktop with one browser on it, driven **computer-use style**. The default interaction contract is deliberately asymmetric:
+- Docker with Compose support
+- Python 3.10 or newer for the host CLI and tests
 
-- **Full-display screenshots + X11-level input** (agent-facing, primary): the agent sees the entire display — page, tab strip, extension buttons, browser popups — and acts through the display's real cursor and keyboard focus. Everything a human can click, the agent can click, browser chrome included.
-- **CDP endpoint** (agent-facing, supplemental): the structured side channel. CDP navigates directly to URLs, waits on page lifecycle events, inserts text that X keyboard mapping cannot express reliably, handles uploads and cookies, and exposes the DOM and accessibility tree for semantic grounding.
-- **noVNC view** (human-facing): the same live display, viewable and controllable from a web page when handoff is needed.
-
-The agent and the human are looking at — and taking turns driving — the *same* browser through the *same* screen and cursor. That is the core trick: it's what makes "human solves the CAPTCHA, agent continues the job" seamless, and it makes a handoff nothing more than the agent going hands-off while the human works.
-
-The default rule is: **see through the X display, act through X input, and use CDP only as a supplement.** Routine pointing, clicking, hovering, dragging, scrolling, and keyboard interaction go through the X cursor and focused window — not `Runtime.evaluate("element.click()")` or CDP mouse events. The DOM may identify an element and provide its viewport box, but the resulting action is translated into display coordinates and performed through X input.
-
-**On session start, the agent is handed both the picture and the structure.** `session start` returns an initial full-display screenshot together with a DOM snapshot, so the agent begins with visual understanding plus supplemental semantic context. The working loop stays X-first from there: capture the display, determine what is visibly happening, optionally consult the DOM to ground a target, act through the X cursor or keyboard, then capture the display again to verify the outcome. Direct CDP verbs are reserved for operations such as `Page.navigate`, lifecycle waits, file attachment, cookie access, and `Input.insertText` for Unicode text. This also makes handoffs smarter: an agent that can see a challenge widget knows to enqueue a `captcha` request instead of fumbling selectors against it.
-
-**Session modes.** The default is one task per container — each session has its own display, cursor, browser, and egress identity, so parallel agents never contend for input. For workloads where several subagents must work the *same logged-in site at the same time*, an opt-in shared-session mode is planned: one container, one browser, multiple windows — cookies and logins shared live across every window, each window driven by its own CDP session. That mode is an explicit exception to the X-input-first contract because one X display cannot provide an independent physical cursor per window. The verified mechanics and trade-offs are in [Problems.md](./Problems.md).
-
-### 4. Centralized panel — the human's single pane of glass
-
-Instead of per-session URLs and passwords relayed through chat, all human-intervention requests land in one web dashboard:
-
-- **FIFO queue** of pending requests, so the human services them in order and nothing gets lost.
-- **Typed/filterable requests** — an agent enqueues a request tagged `captcha`, `login`, or `other`, and the human can filter to what they care about (or triage logins before captchas).
-- **Embedded noVNC** — clicking a queue item opens the live browser session right in the panel. Resolve it, mark it done, and the owning agent resumes automatically.
-
-One URL, one credential, every blocked agent visible at a glance.
-
-## Setup & configuration: a required first-run step
-
-Installing the skill is not enough on its own — Sagasu requires an explicit setup pass before the first session, in the style of skills that ship `/setup` and `/config` commands. Setup is where the deployment-shaping choices get made once, recorded in a config file, and inherited by every session afterward:
-
-- **Browser** — which browser runs inside noVNC. Default: **Helium** (lightweight Chromium fork); alternatives selectable at setup.
-- **Network boundary** — LAN (default), localhost-only, or bring-your-own proxy/VPN.
-- **Profile storage** — where persistent browser profiles live on disk.
-- **Panel** — port/address and access credential for the dashboard.
-
-`/setup` runs interactively on install (pull the image, make the choices above, verify the boundary); `/config` views or changes any of it later. Agents and the panel read the same config, so there is exactly one source of truth — no per-session flags drifting away from what the human thinks is deployed.
-
-## Agent interface: CLI + skill
-
-Agents interact with Sagasu through a small CLI (driven via shell) documented by an accompanying skill file — no long-running orchestration API to maintain. The expected verbs, roughly:
-
-```
-sagasu setup                                                   # interactive first-run: browser, network, storage, panel
-sagasu config [get|set <key> [value]]                          # view or change configuration after setup
-sagasu session start [--profile <name>] [--url <start-url>]   # launch a session; print session id + CDP side channel
-                                                               #   and return an initial screenshot + DOM snapshot
-sagasu session screenshot <session-id> [--out <path>]          # capture the full display, browser chrome included
-sagasu session cursor <session-id> move|click|drag ...          # primary: drive the real X cursor
-sagasu session key <session-id> press|type ...                  # primary: send input to the X-focused window
-sagasu session locate <session-id> <css-selector>               # supplemental: DOM target to X-screen coordinates
-sagasu session navigate <session-id> <url>                      # supplemental: direct CDP navigation
-sagasu session insert-text <session-id> <text>                  # supplemental: CDP Unicode text insertion
-sagasu session sequence <session-id> --actions-json <json> --out <path>  # bounded mutations + final screenshot
-sagasu handoff request <session-id> --type captcha|login|other --note "..."   # enqueue for the human, block or poll
-sagasu handoff status <session-id>                             # has the human resolved it?
-sagasu session stop <session-id>                               # tear down (profile persists)
-```
-
-The skill md teaches an agent *when* to reach for these commands and the safety rules around them. Its install flow points at `sagasu setup` as the mandatory first step, and its workflow guidance encodes the interaction hierarchy:
-
-1. **X display for observation** — capture the whole screen, including browser chrome and overlays.
-2. **X input for normal action** — use the real cursor and focused keyboard for clicks, drags, scrolling, and ordinary typing.
-3. **DOM/accessibility for supplemental grounding** — use structure to understand or locate what the screenshot shows, never as the default action mechanism.
-4. **CDP for supplemental browser verbs** — navigate directly, wait for lifecycle events, insert Unicode text, attach files, and manage browser state.
-
-One learned rule rides along: text entry into CJK pages goes through CDP `Input.insertText` after an X-level click establishes focus — X keyboard input is keymap-bound and unreliable for 中文.
-
-### Current session-control commands
-
-The implemented X-control slice uses a UUID4 session label
-(`computer.sagasu.session.id=<uuid>`) to find exactly one running container:
-
-```text
-sagasu session display SESSION
-sagasu session screenshot SESSION --out PATH [--no-pointer] [--overwrite]
-sagasu session dom SESSION --out PATH [--overwrite]
-sagasu session locate SESSION CSS_SELECTOR
-sagasu session navigate SESSION URL
-sagasu session insert-text SESSION TEXT
-sagasu session sequence SESSION --actions-json JSON --out PATH [--settle-ms N] [--no-pointer] [--overwrite]
-sagasu session cursor SESSION position
-sagasu session cursor SESSION move X Y [--duration-ms N] [--steady]
-sagasu session cursor SESSION click X Y [--button BUTTON] [--count N] [--hold-ms N]
-sagasu session cursor SESSION drag X1 Y1 X2 Y2 [--duration-ms N] [--steady]
-sagasu session cursor SESSION scroll X Y --steps N
-```
-
-HumanCursor is the default input backend. `--backend xdotool` opts into the
-low-level fallback; failures never switch backends implicitly. Coordinates are
-integer pixels in the full-display screenshot space and out-of-bounds values
-fail rather than being clamped. Positive scroll steps move upward.
-
-For development containers that predate lifecycle labels, replace `SESSION`
-with `--container sagasu-preview`. `click`, `drag`, and `scroll` also have a
-debug-only `--current` escape hatch; normal automation should always include
-coordinates so movement and action happen under the same session lock.
-
-Non-image commands print structured JSON. Screenshots include the pointer by
-default, stream directly from the container, and are validated before being
-atomically published at `--out`. A per-container nonblocking lock prevents two
-agents from driving the same cursor; observation takes a shared lock, while
-movement takes an exclusive lock.
-
-### Bounded action sequences
-
-`session sequence` applies up to three input mutations in order, waits one
-second for the visible page to settle, then captures and atomically publishes
-one full-display screenshot at `--out`:
+Build the default Helium image and start the persistent preview container:
 
 ```bash
-sagasu session sequence SESSION \
+docker build -t sagasu/session:dev .
+docker compose up -d
+```
+
+To build the stock Chromium variant instead:
+
+```bash
+docker build -t sagasu/session:chromium --build-arg BROWSER=chromium .
+```
+
+Change the Compose image tag if you want the preview service to use that
+variant.
+
+Check that the preview session is running and healthy:
+
+```bash
+docker inspect --format '{{.State.Running}} {{.State.Health.Status}}' sagasu-preview
+```
+
+Until the package is installed on the host, run the CLI from the repository
+root with `PYTHONPATH=src`:
+
+```bash
+PYTHONPATH=src python3 -m sagasu.cli.main \
+  session screenshot --container sagasu-preview \
+  --out /tmp/sagasu-preview.png --overwrite
+```
+
+Alternatively, install the host CLI in a virtual environment:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e .
+sagasu --help
+```
+
+The Compose service uses a named volume mounted at `/profile`. `docker compose
+stop`, `docker start sagasu-preview`, and normal container recreation retain
+that profile. Do not use `docker compose down -v` unless you intentionally want
+to delete the stored browser profile.
+
+## Addressing a session
+
+Every public session command requires exactly one target:
+
+- `SESSION`: a UUID4 resolved through the Docker label
+  `computer.sagasu.session.id=<uuid>`; or
+- `--container NAME`: an explicit container-name override for development.
+
+The included Compose preview has no generated session UUID, so its normal
+target is:
+
+```text
+--container sagasu-preview
+```
+
+The resolver verifies that the selected container is running and carries
+Sagasu image/session labels. UUID resolution requires exactly one running
+container with that label. Lifecycle automation is not implemented yet, so
+additional labeled containers and their profile volumes must currently be
+created outside the CLI.
+
+## CLI reference
+
+The examples below use `sagasu`; prepend
+`PYTHONPATH=src python3 -m sagasu.cli.main` when running from source.
+
+```text
+sagasu session display TARGET
+sagasu session screenshot TARGET --out PATH [--no-pointer] [--overwrite]
+sagasu session dom TARGET --out PATH [--overwrite]
+sagasu session locate TARGET CSS_SELECTOR
+sagasu session navigate TARGET URL
+sagasu session insert-text TARGET TEXT
+sagasu session sequence TARGET --actions-json JSON --out PATH
+                                [--settle-ms N] [--no-pointer] [--overwrite]
+sagasu session cursor TARGET position
+sagasu session cursor TARGET move X Y
+                              [--duration-ms N] [--steady] [--backend BACKEND]
+sagasu session cursor TARGET click X Y
+                               [--button BUTTON] [--count N] [--hold-ms N]
+                               [--backend BACKEND]
+sagasu session cursor TARGET drag X1 Y1 X2 Y2
+                              [--duration-ms N] [--steady] [--backend BACKEND]
+sagasu session cursor TARGET scroll X Y --steps N [--backend BACKEND]
+```
+
+Replace `TARGET` with either a UUID session ID or `--container NAME`.
+`click`, `drag`, and `scroll` also accept the debugging-only `--current` form,
+but normal automation should use explicit coordinates so movement and input
+remain one locked operation.
+
+Non-streaming commands write one structured JSON result to stdout. Expected
+failures are structured JSON on stderr with a nonzero exit status. Screenshot,
+DOM, and sequence commands publish their artifact at `--out` and return its
+path in the JSON response.
+
+### Full-display observation
+
+Query the display or capture its current pixels:
+
+```bash
+sagasu session display --container sagasu-preview
+sagasu session cursor --container sagasu-preview position
+sagasu session screenshot --container sagasu-preview \
+  --out /tmp/sagasu.png --overwrite
+```
+
+Screenshots include the X cursor by default. `--no-pointer` excludes it. The
+PNG is streamed to a temporary file, validated, and atomically published.
+Without `--overwrite`, Sagasu never silently replaces an existing destination
+and has a fallback for filesystems that do not support hard links.
+
+### HumanCursor X control
+
+```bash
+sagasu session cursor --container sagasu-preview move 500 300
+sagasu session cursor --container sagasu-preview click 500 300
+sagasu session cursor --container sagasu-preview drag 500 300 700 300
+sagasu session cursor --container sagasu-preview scroll 700 500 --steps -4
+```
+
+Coordinates are integer pixels in the full-display screenshot space. Invalid
+coordinates fail instead of being clamped. Positive scroll steps move upward;
+negative steps move downward.
+
+HumanCursor is selected by default. Pass `--backend xdotool` to opt into the
+low-level fallback. Sagasu never changes backends implicitly after a failure.
+`--duration-ms` controls move/drag duration; `--steady` requests a straighter
+HumanCursor trajectory.
+
+### Supplemental CDP tools
+
+Capture the active top-level document only when structured detail is useful:
+
+```bash
+sagasu session dom --container sagasu-preview \
+  --out /tmp/sagasu-page.html --overwrite
+```
+
+The output is the live `DOM.getOuterHTML` serialization. Sagasu accepts HTML,
+standalone SVG, and XML documents, validates UTF-8 and size, and publishes the
+artifact atomically. Cross-origin iframe documents are not flattened into the
+top-level output, and linked stylesheets remain links.
+
+Map a visible top-level CSS element into full-display coordinates:
+
+```bash
+sagasu session locate --container sagasu-preview 'button[type=submit]'
+```
+
+The result contains `screen.x` and `screen.y`. Location uses current browser
+window, viewport, zoom, browser-chrome, and X-display metrics; it does not use a
+fixed toolbar offset. It clips the element to the visible viewport and fails
+if the match is missing or has no visible area. `locate` neither scrolls nor
+clicks. Compare its point with a fresh screenshot before using it.
+
+Navigate the active page directly:
+
+```bash
+sagasu session navigate --container sagasu-preview 'https://example.com/'
+```
+
+Only absolute HTTP(S) URLs are accepted. Success means Chromium accepted
+`Page.navigate`; it does not mean the destination has finished loading. Take a
+fresh screenshot before the next decision.
+
+Insert text into the page element that already has focus:
+
+```bash
+sagasu session insert-text --container sagasu-preview '中文 search text'
+```
+
+`Input.insertText` supports Unicode but does not find or focus a field. Click
+the visible field through X first, insert the text, and verify the result with
+a screenshot.
+
+## Bounded action sequences
+
+`session sequence` queues deterministic input actions when no intermediate
+visual decision is required. The container defaults to at most three actions,
+waits one second after the last action, and captures one final screenshot:
+
+```bash
+sagasu session sequence --container sagasu-preview \
   --actions-json '[
     {"operation":"cursor.click","x":650,"y":312},
     {"operation":"text.insert","text":"apples"},
@@ -169,47 +311,65 @@ sagasu session sequence SESSION \
   --out /tmp/sagasu-after.png --overwrite
 ```
 
-The container owns both defaults, so deployments can change them without
-changing the agent-facing command:
+Open the returned `output` image instead of immediately taking a second
+screenshot.
+
+Queueable actions and fields:
+
+| Operation | Required fields | Optional fields |
+| --- | --- | --- |
+| `cursor.move` | `x`, `y` | `duration_ms`, `steady`, `backend` |
+| `cursor.click` | `x`, `y` | `button`, `count`, `hold_ms`, `backend` |
+| `cursor.drag` | `x1`, `y1`, `x2`, `y2` | `duration_ms`, `steady`, `backend` |
+| `cursor.scroll` | `x`, `y`, `steps` | `backend` |
+| `text.insert` | `text` | none |
+| `page.navigate` | absolute HTTP(S) `url` | none |
+
+`page.navigate` may only be the final action. Screenshot, DOM, locate, display,
+pointer observation, and human pause/resume are not queue entries. Unknown
+fields and JSON `null` in optional fields are rejected.
+
+The host validates and canonicalizes the JSON before resolving the container.
+The private executor receives that document through bounded stdin—not one
+large Docker argument—and validates it again. Cursor backends are prepared
+before the display lock. All coordinates are checked before the first
+mutation, then one exclusive lock and idle gate cover the actions, settle
+delay, and screenshot.
+
+For no-overwrite output, the destination is exclusively reserved before the
+executor can mutate the browser. A concurrent destination therefore blocks
+the sequence before any input occurs, and foreign replacements are not
+clobbered.
+
+Actions are not transactional. If one action fails, earlier actions remain
+applied, later actions are skipped, and Sagasu still attempts to publish a
+diagnostic screenshot. The raised error includes its `output`, zero-based
+`failed_index`, and completed/action counts. If pointer observation fails after
+an applied action, that action remains completed and receives structured
+`pointer_observation` metadata. If the final screenshot or pointer query fails,
+the error includes validated `sequence_state`; do not blindly retry the
+mutations.
+
+Use a shorter sequence whenever a click can open a menu, suggestions, an
+overlay, login, CAPTCHA, or otherwise move the next target.
+
+Sequence configuration:
 
 ```text
 SAGASU_SEQUENCE_MAX_ACTIONS=3
 SAGASU_SEQUENCE_SETTLE_MS=1000
 ```
 
-`--settle-ms` overrides the delay for one call and accepts 0–30000 ms. The
-queue limit remains container-authoritative and cannot be raised by a caller.
-Queueable operations are `cursor.move`, `cursor.click`, `cursor.drag`,
-`cursor.scroll`, `text.insert`, and final-position-only `page.navigate`.
-Screenshots, DOM capture, element location, display/pointer observation, and
-human pause/resume are deliberately not actions and remain individual calls.
-The cursor action fields mirror their standalone forms: move uses `x`, `y`,
-optional `duration_ms`/`steady`/`backend`; click uses `x`, `y`, optional
-`button`/`count`/`hold_ms`/`backend`; drag uses `x1`, `y1`, `x2`, `y2` plus
-optional movement fields; and scroll uses `x`, `y`, `steps`, and optional
-`backend`. CDP text uses `text`, while navigation uses an absolute HTTP(S)
-`url`. Unknown fields and JSON `null` values are rejected.
+The maximum can be configured from 1 to 100. `--settle-ms` overrides the
+per-call delay and accepts 0–30000 ms. The container's action limit remains
+authoritative.
 
-The complete JSON array and every cursor coordinate are validated before the
-first mutation. The sequence then holds one exclusive session lock and one
-idle-activity gate across all actions, the settle delay, and the screenshot,
-so another agent or idle motion cannot interleave. Actions are not
-transactional: if one fails, completed actions remain applied, later actions
-are skipped, and a diagnostic screenshot is still published. The returned
-error includes its path and failed zero-based action index.
+## Idle cursor motion
 
-Use fewer than three actions whenever an intermediate result needs visual
-judgment. In particular, overlays, autocomplete menus, navigation, login, and
-CAPTCHA can invalidate a later coordinate. `page.navigate` is therefore only
-accepted as the final action. The CLI publishes the screenshot file; a shell-
-driven agent must open that returned path with its image/vision tool. A future
-MCP adapter can return the same PNG bytes as inline image content.
-
-### Optional idle cursor motion
-
-Each container can run a lightweight idle daemon that plays short, movement-only
-X cursor animations after agent activity stops. It is enabled by default with
-a five-second inactivity delay:
+The container starts a noncritical HumanCursor idle daemon by default. After
+five seconds without a command, it records the stopped cursor as a fixed
+anchor and continuously chooses random visible points within 300 pixels. Each
+movement gets a random duration from 0.3 to 2 seconds.
 
 ```text
 SAGASU_IDLE_ENABLED=1
@@ -219,105 +379,195 @@ SAGASU_IDLE_MIN_DURATION_SECONDS=0.3
 SAGASU_IDLE_MAX_DURATION_SECONDS=2
 ```
 
-Every in-container executor command counts as activity, including screenshots,
-DOM capture, CDP utilities, and cursor observation. Commands take priority over
-idle motion through a separate gate. A command records its intent immediately,
-waits for the current HumanCursor trajectory to finish, and prevents another
-idle movement from starting. Since each trajectory is capped at two seconds,
-this adds at most roughly two seconds of command latency. Human-control pause
-uses the same mechanism, disables idle movement completely, and resume starts
-a fresh cooldown. An unexpected pointer displacement also cancels idle mode as
-a fallback for unannounced external control.
+Every executor command counts as activity. A command announces priority,
+waits for any current idle trajectory to finish, and prevents another idle
+movement from starting until the command completes. Human pause disables idle
+motion, resume starts a new cooldown, and unexpected external pointer movement
+also resets the idle state. Idle mode never clicks, scrolls, drags, or types,
+but its real X movement can still trigger page hover effects. Set
+`SAGASU_IDLE_ENABLED=0` when that is undesirable.
 
-After five idle seconds, the daemon records the current pointer as a fixed
-anchor and continuously chooses random visible destinations within a 300-pixel
-circle around it. Every movement uses HumanCursor with a separately randomized
-duration from 0.3 to 2 seconds. The anchor does not drift as the cursor moves;
-new agent or human activity clears it. Idle motion never clicks, scrolls,
-drags, or types. Because genuine X pointer movement still generates browser
-mousemove and hover events, disable this when those page-visible effects are
-not acceptable.
+## Manual human intervention
 
-`session dom` uses the selected container's loopback-only CDP endpoint to
-serialize the live DOM of the currently visible browser tab as UTF-8 HTML. It
-detects the visible target rather than assuming the first tab, takes the same
-shared observation lock as screenshots, and validates and atomically publishes
-the document at `--out`. The returned JSON includes the page target ID, title,
-URL, byte count, display dimensions, and pointer position. This is the current
-top-level document markup: linked stylesheets remain links, computed styles are
-not inlined, and cross-origin iframe documents are not flattened into it.
+The image contains noVNC and a private pause marker, but the public handoff
+queue and panel are not implemented. The Compose file intentionally does not
+publish noVNC. For local development only, uncomment this loopback mapping and
+recreate the service:
 
-`session locate` resolves a CSS selector in that active top-level document,
-clips its CDP content quads to the visible page viewport, and returns a safe
-point as `screen.x` and `screen.y` in the full-display screenshot coordinate
-space. It derives the browser-chrome offset from live window, viewport, zoom,
-and X-display metrics rather than using a fixed toolbar height. It is a
-read-only grounding operation: it neither scrolls nor clicks. An offscreen or
-missing element fails explicitly, and the agent must still compare the result
-with a fresh screenshot before passing it to the X cursor.
+```yaml
+ports:
+  - "127.0.0.1:9222:9222"
+  - "127.0.0.1:6080:6080"
+```
 
-Standalone `session navigate` sends an absolute HTTP(S) URL to the active page with
-`Page.navigate`. It reports when Chromium accepts or rejects the navigation;
-it does not imply that the destination has finished loading, so capture a fresh
-screenshot and DOM afterward. `session insert-text` sends `Input.insertText`
-to the currently focused page element and supports Unicode without depending
-on the X keyboard map. Establish focus first with an X-level click and verify
-the visible result afterward. Both commands take the exclusive session lock
-and are blocked while control is paused for a human.
+Then open `http://127.0.0.1:6080/`. The current noVNC endpoint has no session
+password, so never bind it to `0.0.0.0` or a LAN/public address.
 
-The host invokes the private `sagasu-session-exec` entry point inside the
-resolved container. `sagasu-xcontrol` remains available as a compatibility
-alias, but new integrations should use `sagasu`; the private executable is an
-implementation detail.
+Pause agent mutations before handing control to a person:
 
-The design rule that keeps the CLI honest: **it only automates what has exactly one correct way to be done** — container lifecycle, port/volume wiring, screenshots, X input delivery, CDP utility verbs, and queue registration. It is an on-ramp, not a gatekeeper: everything requiring judgment (what to click, when to hand off, which page state matters) stays with the agent, while the skill keeps the transport choice consistent — X input by default, CDP when the operation is inherently structured.
+```bash
+docker exec --user sagasu sagasu-preview \
+  sagasu-session-exec human pause
+```
+
+While paused, cursor actions, CDP mutations, and sequences fail with
+`human_control`; idle motion is disabled. Observation commands remain
+technically available, but an agent should stop interacting until the person
+confirms completion. Resume with:
+
+```bash
+docker exec --user sagasu sagasu-preview \
+  sagasu-session-exec human resume
+```
+
+Capture a fresh screenshot before continuing. These private commands are the
+current bare handoff mechanism, not a stable public handoff API.
+
+## Profiles and container lifecycle
+
+The browser always uses `PROFILE_DIR` (`/profile` by default). The included
+Compose service mounts a named volume there, so cookies, logins, local storage,
+and trusted-device state survive container restarts and image updates.
+
+On a graceful stop, the supervisor terminates the browser first and waits for
+its profile databases to flush before stopping Xvnc and the support processes.
+On the next start, the entrypoint removes stale Chromium `Singleton*` locks
+left by an earlier forced termination.
+
+The service uses `restart: "no"`. A critical session component exiting ends
+the container instead of silently resurrecting a browser session. The idle
+daemon is the exception: if it exits, browsing continues with idle motion
+disabled.
+
+Profiles contain authenticated session material. Keep profile volumes local,
+restrict Docker access, and delete a volume only as an explicit account-state
+operation.
+
+## Container configuration
+
+Important image environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `START_URL` | `about:blank` | Initial browser URL |
+| `SCREEN_GEOMETRY` | `1366x768` | X display and browser-window size |
+| `PROFILE_DIR` | `/profile` | Persistent browser profile path |
+| `BROWSER_EXTRA_ARGS` | empty | Additional browser flags |
+| `SAGASU_NO_SANDBOX` | empty | Dangerous debugging escape hatch |
+| `SAGASU_IDLE_ENABLED` | `1` | Enable the idle cursor daemon |
+| `SAGASU_IDLE_AFTER_SECONDS` | `5` | Idle delay before motion |
+| `SAGASU_IDLE_RADIUS_PX` | `300` | Radius around the fixed idle anchor |
+| `SAGASU_IDLE_MIN_DURATION_SECONDS` | `0.3` | Minimum idle movement duration |
+| `SAGASU_IDLE_MAX_DURATION_SECONDS` | `2` | Maximum idle movement duration |
+| `SAGASU_SEQUENCE_MAX_ACTIONS` | `3` | Container-authoritative queue limit |
+| `SAGASU_SEQUENCE_SETTLE_MS` | `1000` | Default delay before final screenshot |
+
+The default image uses Helium. Build with `--build-arg BROWSER=chromium` for
+stock Chromium. HumanCursor, websocket-client, noVNC, and browser downloads are
+pinned in the Dockerfile.
+
+## Security model
+
+- The browser runs as the unprivileged `sagasu` user.
+- Chromium's sandbox remains enabled by default through the supplied seccomp
+  policy; the container adds no capabilities and is not privileged.
+- `SAGASU_NO_SANDBOX=1` is for debugging only. It allows a renderer compromise
+  to read the entire authenticated profile.
+- VNC listens only on container loopback and is never published.
+- noVNC is reachable inside the Compose network but is unpublished by default.
+- CDP is unauthenticated browser control and is published only on host
+  `127.0.0.1:9222`. Never change that mapping to a non-loopback address.
+- Output files use validation and atomic/no-clobber publication.
+- A per-container lock allows compatible observations together but rejects
+  conflicting input rather than interleaving two actors on one cursor.
+
+## Concurrency and multiple sessions
+
+One X display has one cursor and one keyboard focus. Sagasu serializes input
+inside a container; it does not pretend that multiple agents can independently
+drive one display.
+
+Parallelism is container-level: each concurrent browser needs its own
+container, profile volume, display, and optional host ports. The host CLI can
+resolve manually created containers by UUID4 session labels, but the command
+that creates and destroys those containers is not implemented yet. The
+included Compose file is therefore a single-session preview, and its explicit
+container-name override is the supported development path.
+
+## Testing
+
+Install the test dependency and run the suite:
+
+```bash
+python -m pip install -e '.[test]'
+pytest -q
+```
+
+Live tests require a built, healthy container:
+
+```bash
+SAGASU_LIVE_CONTAINER=sagasu-preview pytest -m live tests/integration
+```
+
+Idle-specific live coverage also requires:
+
+```bash
+SAGASU_LIVE_CONTAINER=sagasu-preview \
+SAGASU_LIVE_IDLE=1 \
+pytest -m live tests/integration
+```
+
+The unit suite covers the CLI/protocol, Docker resolution and streaming,
+artifact safety, CDP utilities, coordinate conversion, HumanCursor/xdotool
+backends, idle arbitration, action sequences, and architecture boundaries.
 
 ## Repository layout
 
-The implemented Python distribution is organized by responsibility:
-
-```
+```text
 sagasu/
 ├── pyproject.toml
 ├── src/sagasu/
-│   ├── protocol.py       # stable JSON success/error protocol
-│   ├── cli/              # public CLI, container executor, and idle daemon
-│   ├── sessions/         # resolution, transport, locks, activity, handoff state
-│   ├── artifacts/        # atomic publication and PNG/HTML validation
-│   ├── cdp/              # CDP transport and live-DOM capture
-│   └── xcontrol/         # X display capture and cursor control only
-│       ├── cursor/       # separate move, click, drag, and scroll operations
-│       └── idle/         # modular, interruptible idle-animation patterns
-├── tests/                # unit, architecture-boundary, and opt-in live checks
-├── Dockerfile            # Xvnc, browser, noVNC, and installed executor
-└── docker/               # entrypoint, supervisor, healthcheck, and seccomp
+│   ├── protocol.py       # shared JSON success/error protocol
+│   ├── cli/              # public CLI, private executor, sequence, idle daemon
+│   ├── sessions/         # Docker resolution, locks, activity, artifact flow
+│   ├── artifacts/        # PNG/DOM validation and safe publication
+│   ├── cdp/              # CDP transport, targets, DOM, locate, navigate, text
+│   └── xcontrol/         # X display capture and cursor control
+├── tests/                # unit and opt-in live-container coverage
+├── Dockerfile            # Xvnc, browser, HumanCursor, noVNC, executor
+├── docker-compose.yml    # persistent single-session preview
+└── docker/               # entrypoint, supervisor, healthcheck, seccomp
 ```
 
-The dependency direction is enforced by tests: `xcontrol` cannot import CDP,
-session, artifact, or CLI modules; the CLI is the composition layer that joins
-those domains.
+Architecture tests enforce dependency direction: `xcontrol` cannot import
+CDP, session, artifact, or CLI modules; the CLI is the composition layer that
+joins those domains.
 
-## Network model: LAN by default, pluggable by design
+## Roadmap
 
-The human-facing surfaces (panel, noVNC) bind to the host's LAN address; internals (VNC, CDP) stay on localhost/container networks. LAN is the default because it assumes nothing: not everyone runs Tailscale, and anyone who does can already reach the LAN address through their tailnet — so VPN access comes for free without being a dependency. Because a LAN is broader than a VPN-only binding, the panel carries its own access credential: the local network is reachable, not trusted.
+The next major layers are intentionally not presented as current features:
 
-The boundary remains a deployment choice, not an assumption baked into the code — tightening to localhost-only, or fronting with a reverse proxy or VPN of your choice, should be configuration, not surgery.
+- interactive setup/configuration;
+- profile-aware session start/stop and port allocation;
+- a public human-intervention API with request state and resume signaling;
+- an authenticated panel embedding per-session noVNC views;
+- general X keyboard operations;
+- CDP lifecycle waits, file uploads, cookies, and accessibility data;
+- optional MCP transport and inline screenshots; and
+- an explicitly different shared-login multi-window mode.
+
+Until those exist, Sagasu is best understood as a secure, persistent browser
+container plus a tested X-first session-control CLI.
 
 ## Principles
 
-- **X input is primary.** The agent normally observes the full X display and acts through its real cursor and keyboard. CDP supplies direct navigation, semantic context, and browser-native utility operations; it does not replace the default screen-and-cursor loop.
-- **Handoff, not bypass.** Sagasu lets a human complete challenges in an agent-controlled browser. It does not and will not automate CAPTCHA solving or circumvent site protections.
-- **Humans own their secrets.** Agents never ask for, read, or handle passwords and 2FA codes — they open the page and step aside.
-- **Never public.** VNC/CDP internals are never exposed beyond localhost; the human-facing surface is never exposed beyond the configured boundary.
-- **Sessions are sensitive.** Persistent profiles hold real authenticated state and are treated accordingly — stored deliberately, scoped by name, easy to destroy.
-
-## Status
-
-The session container is built: Dockerfile + compose file with Helium (GPG-verified download), TigerVNC, X-level input and display-capture tools (`xdotool` + `scrot`), vendored noVNC, a sandbox-on seccomp profile, and loopback-only internals — verified end-to-end (healthy under compose, CDP reachable from the host only on loopback, clean browser-first shutdown, CJK rendering).
-
-The current slice includes resolved-session display, screenshot, DOM, mouse
-control, bounded mixed-action sequences with an automatic final screenshot,
-direct CDP navigation, and CDP Unicode text insertion. Remaining work
-includes `setup`/`config`, lifecycle management with named profiles, X keyboard
-control and additional CDP utility verbs, the intervention queue and panel,
-embedded noVNC resume signaling, and the finished agent skill/docs.
+- **X cursor first.** Use screenshots and the real cursor for ordinary visual
+  interaction; use CDP only when the operation is naturally structured.
+- **Vision before DOM.** Pixels are authoritative for overlays, browser chrome,
+  and blockers; fetch structure only when it adds useful detail.
+- **Handoff, not bypass.** Pause for login, 2FA, CAPTCHA, and other human-only
+  steps instead of trying to circumvent them.
+- **Profiles are secrets.** Persistent browser state is authenticated account
+  material, not disposable cache.
+- **No unsafe network defaults.** VNC stays private, noVNC stays unpublished,
+  and CDP remains loopback-only.
