@@ -12,3 +12,4 @@ package-lock.json
 .pi-subagents/*
 observations/*
 report.md
+graphify-out/
