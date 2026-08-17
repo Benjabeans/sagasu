@@ -40,6 +40,7 @@ def controller(
     *,
     after=1.0,
     radius=30,
+    stationary_chance=0.0,
     random_duration=None,
 ):
     mover = FakeMover(pointer)
@@ -56,6 +57,7 @@ def controller(
             radius_pixels=radius,
             minimum_duration_seconds=0.3,
             maximum_duration_seconds=2.0,
+            stationary_chance=stationary_chance,
             poll_seconds=0.1,
         ),
         mover,
@@ -127,9 +129,63 @@ def test_controller_waits_for_idle_then_moves_continuously(tmp_path):
     idle.step()
     idle.step()
     assert len(mover.calls) == 2
-    assert all(call[2:] == (0.75, False) for call in mover.calls)
+    assert all(
+        duration == 0.75 and not steady for _, _, duration, steady in mover.calls
+    )
 
     record_activity(tmp_path / "activity", now_ns=clock)
+    idle.step()
+    assert len(mover.calls) == 2
+
+
+def test_stationary_phase_only_follows_a_completed_movement(tmp_path):
+    clock = FakeClock()
+    pointer = [PointerPosition(40, 30)]
+    idle, mover = controller(
+        tmp_path,
+        clock,
+        pointer,
+        stationary_chance=1.0,
+    )
+    idle.initialize()
+    clock.advance(1.1)
+
+    idle.step()
+    assert len(mover.calls) == 1
+
+    idle.step()
+    clock.advance(0.74)
+    idle.step()
+    assert len(mover.calls) == 1
+
+    clock.advance(0.02)
+    idle.step()
+    assert len(mover.calls) == 2
+
+
+def test_activity_cancels_stationary_phase_and_starts_a_fresh_cooldown(
+    tmp_path,
+):
+    clock = FakeClock()
+    pointer = [PointerPosition(40, 30)]
+    idle, mover = controller(
+        tmp_path,
+        clock,
+        pointer,
+        stationary_chance=1.0,
+    )
+    idle.initialize()
+    clock.advance(1.1)
+    idle.step()
+    assert len(mover.calls) == 1
+
+    record_activity(tmp_path / "activity", now_ns=clock)
+    idle.step()
+    clock.advance(0.9)
+    idle.step()
+    assert len(mover.calls) == 1
+
+    clock.advance(0.2)
     idle.step()
     assert len(mover.calls) == 2
 
@@ -154,8 +210,7 @@ def test_continuous_destinations_keep_the_original_idle_anchor(tmp_path):
 
     assert len(mover.calls) == 30
     assert all(
-        math.hypot(x - anchor.x, y - anchor.y) <= 20
-        for x, y, _, _ in mover.calls
+        math.hypot(x - anchor.x, y - anchor.y) <= 20 for x, y, _, _ in mover.calls
     )
     durations = [duration for _, _, duration, _ in mover.calls]
     assert all(duration is not None and 0.3 <= duration <= 2 for duration in durations)
@@ -211,6 +266,7 @@ def test_idle_configuration_is_validated():
     assert defaults.radius_pixels == 300
     assert defaults.minimum_duration_seconds == 0.3
     assert defaults.maximum_duration_seconds == 2
+    assert defaults.stationary_chance == 0.25
 
     configured = IdleConfig.from_environ(
         {
@@ -218,17 +274,21 @@ def test_idle_configuration_is_validated():
             "SAGASU_IDLE_RADIUS_PX": "250",
             "SAGASU_IDLE_MIN_DURATION_SECONDS": "0.4",
             "SAGASU_IDLE_MAX_DURATION_SECONDS": "1.5",
+            "SAGASU_IDLE_STATIONARY_CHANCE": "0.4",
         }
     )
     assert configured.after_seconds == 7
     assert configured.radius_pixels == 250
     assert configured.minimum_duration_seconds == 0.4
     assert configured.maximum_duration_seconds == 1.5
+    assert configured.stationary_chance == 0.4
 
     invalid_environments = (
         {"SAGASU_IDLE_RADIUS_PX": "0"},
         {"SAGASU_IDLE_AFTER_SECONDS": "not-a-number"},
         {"SAGASU_IDLE_AFTER_SECONDS": "nan"},
+        {"SAGASU_IDLE_STATIONARY_CHANCE": "-0.1"},
+        {"SAGASU_IDLE_STATIONARY_CHANCE": "1.1"},
         {
             "SAGASU_IDLE_MIN_DURATION_SECONDS": "1",
             "SAGASU_IDLE_MAX_DURATION_SECONDS": "0.5",

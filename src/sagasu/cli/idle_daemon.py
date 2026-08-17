@@ -1,4 +1,4 @@
-"""Per-container daemon for continuous HumanCursor idle movement."""
+"""Per-container daemon for HumanCursor idle movement and stationary phases."""
 
 from __future__ import annotations
 
@@ -8,10 +8,11 @@ import random
 import signal
 import sys
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
-from typing import Callable, Mapping, TextIO
+from typing import TextIO
 
 from sagasu.protocol import SagasuError
 from sagasu.sessions import human_control
@@ -39,11 +40,12 @@ class IdleConfig:
     radius_pixels: int = 300
     minimum_duration_seconds: float = 0.3
     maximum_duration_seconds: float = 2.0
+    stationary_chance: float = 0.25
     poll_seconds: float = 0.25
     error_backoff_seconds: float = 5.0
 
     @classmethod
-    def from_environ(cls, environ: Mapping[str, str]) -> "IdleConfig":
+    def from_environ(cls, environ: Mapping[str, str]) -> IdleConfig:
         minimum_duration = _environment_float(
             environ,
             "SAGASU_IDLE_MIN_DURATION_SECONDS",
@@ -63,6 +65,17 @@ class IdleConfig:
                 "SAGASU_IDLE_MIN_DURATION_SECONDS",
                 exit_status=2,
             )
+        stationary_chance = _environment_float(
+            environ,
+            "SAGASU_IDLE_STATIONARY_CHANCE",
+            0.25,
+            minimum=0.0,
+        )
+        if stationary_chance > 1.0:
+            raise _environment_error(
+                "SAGASU_IDLE_STATIONARY_CHANCE",
+                environ["SAGASU_IDLE_STATIONARY_CHANCE"],
+            )
         return cls(
             after_seconds=_environment_float(
                 environ, "SAGASU_IDLE_AFTER_SECONDS", 5.0, minimum=0.0
@@ -72,11 +85,12 @@ class IdleConfig:
             ),
             minimum_duration_seconds=minimum_duration,
             maximum_duration_seconds=maximum_duration,
+            stationary_chance=stationary_chance,
         )
 
 
 class IdleController:
-    """Run one complete HumanCursor movement per ``step`` while idle."""
+    """Run idle movements with optional stationary phases between them."""
 
     def __init__(
         self,
@@ -107,6 +121,7 @@ class IdleController:
         self._seen_activity: int | None = None
         self._anchor: PointerPosition | None = None
         self._expected_pointer: PointerPosition | None = None
+        self._stationary_until_ns: int | None = None
         self._was_paused = False
 
     def initialize(self) -> None:
@@ -142,9 +157,12 @@ class IdleController:
             self._seen_activity = activity
             self._reset_idle()
 
-        idle_deadline = activity + self._seconds_ns(
-            self.config.after_seconds
-        )
+        if self._stationary_until_ns is not None:
+            if now < self._stationary_until_ns:
+                return self._bounded_delay(self._stationary_until_ns - now)
+            self._stationary_until_ns = None
+
+        idle_deadline = activity + self._seconds_ns(self.config.after_seconds)
         if now < idle_deadline:
             return self._bounded_delay(idle_deadline - now)
         return self._advance_movement(activity)
@@ -214,13 +232,23 @@ class IdleController:
             steady=False,
         )
         self._expected_pointer = target
-        # The movement itself supplies pacing. Re-enter immediately so motion
-        # remains continuous unless a command has announced new activity.
+        if self._random_value() < self.config.stationary_chance:
+            stationary_seconds = self._random_duration(
+                self.config.minimum_duration_seconds,
+                self.config.maximum_duration_seconds,
+            )
+            stationary_ns = self._seconds_ns(stationary_seconds)
+            self._stationary_until_ns = self._clock_ns() + stationary_ns
+            return self._bounded_delay(stationary_ns)
+
+        # Without a stationary phase, the movement itself supplies pacing.
+        # Re-enter immediately unless a command has announced new activity.
         return 0.001
 
     def _reset_idle(self) -> None:
         self._anchor = None
         self._expected_pointer = None
+        self._stationary_until_ns = None
 
     def _bounded_delay(self, remaining_ns: int) -> float:
         remaining = max(0.0, remaining_ns / 1_000_000_000)
@@ -252,7 +280,8 @@ def main() -> int:
         f"(after={config.after_seconds:g}s, backend=humancursor, "
         f"radius={config.radius_pixels}px, "
         f"duration={config.minimum_duration_seconds:g}-"
-        f"{config.maximum_duration_seconds:g}s, continuous=true)"
+        f"{config.maximum_duration_seconds:g}s, "
+        f"stationary-chance={config.stationary_chance:.0%})"
     )
     IdleController(config, mover).run(stop, log=_log)
     _log("stopped")

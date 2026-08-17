@@ -84,10 +84,12 @@ because that could select a different profile.
 ## Account for idle cursor motion
 
 The preview container enables HumanCursor idle motion by default. Five seconds
-after the last executor command, the pointer begins moving continuously to
-random visible points within 300 pixels of its stopped position; each movement
-takes 0.3 to 2 seconds. Idle mode never clicks, scrolls, drags, or types, and a
-new executor command takes priority and resets its cooldown.
+after the last executor command, the pointer begins moving to random visible
+points within 300 pixels of its stopped position; each movement takes 0.3 to 2
+seconds. After a completed movement, there is a 25% chance that the pointer
+stays stationary for another random 0.3 to 2 seconds before movement resumes.
+Idle mode never clicks, scrolls, drags, or types, and a new executor command
+takes priority and resets its cooldown.
 
 Do not interpret idle motion as an action result. Idle hover can still open a
 menu or change a hover-sensitive page. Treat a coordinate as stale when idle

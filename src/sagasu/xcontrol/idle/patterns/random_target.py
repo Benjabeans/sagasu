@@ -1,10 +1,10 @@
-"""Random bounded destinations for continuous idle cursor movement."""
+"""Random bounded destinations for idle cursor movement."""
 
 from __future__ import annotations
 
 import math
 import random
-from typing import Callable
+from collections.abc import Callable
 
 from sagasu.xcontrol.display import DisplaySize, PointerPosition
 
@@ -52,7 +52,7 @@ def random_target(
 
 
 def _unit(value: float) -> float:
-    return max(0.0, min(float(value), 1.0))
+    return max(0.0, min(value, 1.0))
 
 
 def _distance(first: PointerPosition, second: PointerPosition) -> float:

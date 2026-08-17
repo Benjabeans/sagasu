@@ -26,7 +26,7 @@ or the centralized human panel described in the longer-term design.
 | `xdotool` cursor fallback | General X keyboard press/type commands |
 | CDP DOM, locate, navigate, and focused text insertion | CDP lifecycle waits, uploads, cookies, and accessibility tools |
 | Up to three queued mutations plus an automatic screenshot | MCP server or inline image responses |
-| Continuous idle cursor animation | Shared-login, multi-window session mode |
+| Idle cursor animation with post-movement pauses | Shared-login, multi-window session mode |
 | Private pause/resume for manual handoff | Automatic human-resume signaling |
 
 The implemented public CLI commands are:
@@ -368,8 +368,11 @@ authoritative.
 
 The container starts a noncritical HumanCursor idle daemon by default. After
 five seconds without a command, it records the stopped cursor as a fixed
-anchor and continuously chooses random visible points within 300 pixels. Each
-movement gets a random duration from 0.3 to 2 seconds.
+anchor and repeatedly chooses random visible points within 300 pixels. Each
+movement gets a random duration from 0.3 to 2 seconds. After a completed
+movement, there is a 25% chance that the cursor remains stationary for another
+random 0.3 to 2 seconds before movement resumes. A stationary phase never
+occurs before its preceding movement completes.
 
 ```text
 SAGASU_IDLE_ENABLED=1
@@ -377,7 +380,11 @@ SAGASU_IDLE_AFTER_SECONDS=5
 SAGASU_IDLE_RADIUS_PX=300
 SAGASU_IDLE_MIN_DURATION_SECONDS=0.3
 SAGASU_IDLE_MAX_DURATION_SECONDS=2
+SAGASU_IDLE_STATIONARY_CHANCE=0.25
 ```
+
+The stationary chance accepts a value from 0 to 1. Movement and stationary
+phases share the configured minimum and maximum duration range.
 
 Every executor command counts as activity. A command announces priority,
 waits for any current idle trajectory to finish, and prevents another idle
@@ -457,8 +464,9 @@ Important image environment variables:
 | `SAGASU_IDLE_ENABLED` | `1` | Enable the idle cursor daemon |
 | `SAGASU_IDLE_AFTER_SECONDS` | `5` | Idle delay before motion |
 | `SAGASU_IDLE_RADIUS_PX` | `300` | Radius around the fixed idle anchor |
-| `SAGASU_IDLE_MIN_DURATION_SECONDS` | `0.3` | Minimum idle movement duration |
-| `SAGASU_IDLE_MAX_DURATION_SECONDS` | `2` | Maximum idle movement duration |
+| `SAGASU_IDLE_MIN_DURATION_SECONDS` | `0.3` | Minimum movement or stationary-phase duration |
+| `SAGASU_IDLE_MAX_DURATION_SECONDS` | `2` | Maximum movement or stationary-phase duration |
+| `SAGASU_IDLE_STATIONARY_CHANCE` | `0.25` | Chance of pausing after each completed idle movement |
 | `SAGASU_SEQUENCE_MAX_ACTIONS` | `3` | Container-authoritative queue limit |
 | `SAGASU_SEQUENCE_SETTLE_MS` | `1000` | Default delay before final screenshot |
 
